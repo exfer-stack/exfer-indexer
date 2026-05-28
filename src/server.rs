@@ -11,7 +11,6 @@ use std::sync::Arc;
 use crate::api::ApiState;
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::Result;
 use crate::follower::Follower;
 use crate::upstream::NodeClient;
 

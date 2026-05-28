@@ -1,22 +1,82 @@
-//! redb-backed storage layer for the indexer.
+//! redb-backed storage layer.
 //!
-//! Tables and full read/write API land in commits #13 and #14 of the
-//! workflow plan (`exfer-indexer follower + extraction` and
-//! `exfer-indexer RPC methods`). This module exists from the scaffold
-//! commit so the rest of the crate can name `crate::db::Db`.
-
-pub mod schema;
+//! Three groups of operations live here:
+//!
+//! 1. **Follower checkpoint** — `load_meta` / `save_meta` for the
+//!    follower task's resumable position.
+//! 2. **Upsert pipeline** — `apply_block_events` writes every event
+//!    extracted from a block (HTLC lock / claim / reclaim, address
+//!    activity, settlement) **plus** the chain-tip meta update in a
+//!    single redb write transaction. Atomic: crash between blocks
+//!    rolls back the partial work; crash after commit means the
+//!    in-memory state matches disk.
+//! 3. **Queries** — read helpers used by the JSON-RPC handlers
+//!    (added in commit #14). The follower-side commit only needs
+//!    a few of these for reorg recovery, so they live here too.
 
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use exfer::covenants::htlc::{HtlcRecord, HtlcRole, HtlcState};
+use redb::{ReadableTable, ReadableTableMetadata};
+use serde::{Deserialize, Serialize};
 
-/// Indexer storage handle. Wraps a single redb file at
-/// `<datadir>/index.redb` and exposes typed read / write helpers.
-///
-/// Real CRUD methods land in the follower + queries commits; this
-/// stub just owns the redb `Database` and creates the file on first
-/// open.
+use crate::error::{Error, Result};
+use crate::extract::{
+    AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, HtlcSpendArm, SettlementRecord,
+};
+
+pub mod schema;
+
+use schema::{
+    BLOCK_META, CHAIN_TIP, CHAIN_TIP_KEY, HTLC_BY_HASHLOCK, HTLC_BY_RECEIVER, HTLC_BY_SENDER,
+    HTLC_BY_STATE, HTLC_FULL, SETTLEMENT_BY_ADDRESS, SETTLEMENT_BY_CONTRACT, SPENT_BY,
+    TX_BY_ADDRESS,
+};
+
+// ---------------------------------------------------------------------------
+// Follower checkpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowerMeta {
+    pub last_indexed_height: u64,
+    pub last_indexed_block_id: [u8; 32],
+    pub full_scan_complete: bool,
+    /// Unix seconds when the follower first started. Stable across
+    /// restarts; only the very first save writes it.
+    pub started_at: u64,
+}
+
+impl Default for FollowerMeta {
+    fn default() -> Self {
+        Self {
+            last_indexed_height: 0,
+            last_indexed_block_id: [0u8; 32],
+            full_scan_complete: false,
+            started_at: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-block snapshot (what the follower hands to apply_block_events)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMeta {
+    pub block_id: [u8; 32],
+    pub tx_count: u64,
+    pub timestamp: u64,
+}
+
+/// Direction byte for [`TX_BY_ADDRESS`].
+const DIR_OUTPUT_TO: u8 = 0x01;
+const DIR_INPUT_FROM: u8 = 0x02;
+
+// ---------------------------------------------------------------------------
+// Db handle
+// ---------------------------------------------------------------------------
+
 pub struct Db {
     db: redb::Database,
 }
@@ -29,8 +89,6 @@ impl Db {
         let db = redb::Database::create(&path)
             .map_err(|e| Error::Storage(format!("open {}: {e}", path.display())))?;
 
-        // Pre-create every table so subsequent read txns don't trip on
-        // "table not found" on a fresh datadir.
         let write = db.begin_write()?;
         {
             schema::open_all_tables(&write)?;
@@ -40,10 +98,664 @@ impl Db {
         Ok(Self { db })
     }
 
-    /// Raw redb handle. Held `pub(crate)` so the follower and query
-    /// modules can manage their own write / read transactions
-    /// without re-wrapping every operation.
     pub(crate) fn raw(&self) -> &redb::Database {
         &self.db
     }
+
+    // ---- Follower checkpoint ---------------------------------------------
+
+    pub fn load_meta(&self) -> Result<FollowerMeta> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(CHAIN_TIP)?;
+        match table.get(CHAIN_TIP_KEY)? {
+            Some(blob) => bincode::deserialize(blob.value())
+                .map_err(|e| Error::Storage(format!("decode meta: {e}"))),
+            None => Ok(FollowerMeta::default()),
+        }
+    }
+
+    pub fn save_meta(&self, meta: &FollowerMeta) -> Result<()> {
+        let blob = bincode::serialize(meta)
+            .map_err(|e| Error::Storage(format!("encode meta: {e}")))?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(CHAIN_TIP)?;
+            table.insert(CHAIN_TIP_KEY, blob.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Number of HTLCs currently in the primary table. Used by
+    /// `get_indexer_status`.
+    pub fn htlc_count(&self) -> Result<u64> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(HTLC_FULL)?;
+        Ok(table.len()?)
+    }
+
+    // ---- The atomic per-block apply pipeline -----------------------------
+
+    /// Apply every event extracted from one block in a single write
+    /// transaction. The chain-tip meta is advanced inside the same
+    /// transaction so a crash between blocks rolls back **everything**
+    /// from the partial block; a crash after commit means the on-disk
+    /// state is exactly "everything up through this block."
+    ///
+    /// Idempotent on replay: re-applying the same block produces the
+    /// same final byte state, so a crash-and-resume mid-walk is safe.
+    pub fn apply_block_events(&self, events: BlockApplyEvents<'_>) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            // ---- 1. block_meta row ----
+            {
+                let mut t = write.open_table(BLOCK_META)?;
+                let key = events.height.to_be_bytes();
+                let val = bincode::serialize(&BlockMeta {
+                    block_id: events.block_id,
+                    tx_count: events.tx_count,
+                    timestamp: events.timestamp,
+                })
+                .map_err(|e| Error::Storage(format!("encode block_meta: {e}")))?;
+                t.insert(key.as_slice(), val.as_slice())?;
+            }
+
+            // ---- 2. HTLC locks (new outputs) ----
+            for lock in events.locks {
+                upsert_htlc_within_txn(&write, &lock.record)?;
+            }
+
+            // ---- 3. HTLC spends (claims / reclaims) ----
+            for spend in events.spends {
+                advance_htlc_within_txn(&write, spend, events.height)?;
+            }
+
+            // ---- 4. Settlement records (one per claim / reclaim) ----
+            for sett in events.settlements {
+                write_settlement_within_txn(&write, sett)?;
+            }
+
+            // ---- 5. Address activity (every input + every output) ----
+            for act in events.activity {
+                write_activity_within_txn(&write, act, events.height)?;
+            }
+
+            // ---- 6. Optional spent_by cache ----
+            for sb in events.spent_by {
+                write_spent_by_within_txn(&write, sb)?;
+            }
+
+            // ---- 7. Advance chain-tip meta ----
+            {
+                let mut t = write.open_table(CHAIN_TIP)?;
+                let new_meta = FollowerMeta {
+                    last_indexed_height: events.height,
+                    last_indexed_block_id: events.block_id,
+                    full_scan_complete: events.full_scan_complete,
+                    started_at: events.started_at,
+                };
+                let blob = bincode::serialize(&new_meta)
+                    .map_err(|e| Error::Storage(format!("encode meta: {e}")))?;
+                t.insert(CHAIN_TIP_KEY, blob.as_slice())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    // ---- Reorg support --------------------------------------------------
+
+    /// Remove every record whose lock_block_height (or settlement
+    /// block_height) is strictly greater than `keep_below`. Called
+    /// from the follower's reorg recovery path.
+    ///
+    /// Conservative: walks each table. The indexer's expected steady
+    /// state is "few hundred / few thousand entries"; the optimizer
+    /// for a large reorg over a busy chain is a v0.2 concern.
+    pub fn wipe_above(&self, keep_below: u64) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            // Collect victim primary keys from HTLC_FULL by deserializing
+            // each record and looking at lock_block_height.
+            let mut htlc_victims: Vec<[u8; 36]> = Vec::new();
+            let mut victim_records: Vec<HtlcRecord> = Vec::new();
+            {
+                let t = write.open_table(HTLC_FULL)?;
+                let iter = t.iter()?;
+                for entry in iter {
+                    let (k, v) = entry?;
+                    let rec: HtlcRecord = bincode::deserialize(v.value())
+                        .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?;
+                    let h = rec.lock_block_height.unwrap_or(u64::MAX);
+                    if h > keep_below {
+                        let mut kk = [0u8; 36];
+                        kk.copy_from_slice(k.value());
+                        htlc_victims.push(kk);
+                        victim_records.push(rec);
+                    }
+                }
+            }
+            for (key, rec) in htlc_victims.iter().zip(victim_records.iter()) {
+                forget_htlc_within_txn(&write, key, rec)?;
+            }
+
+            // Wipe block_meta tail.
+            let block_meta_tail = {
+                let t = write.open_table(BLOCK_META)?;
+                let iter = t.iter()?;
+                let mut keys: Vec<[u8; 8]> = Vec::new();
+                for entry in iter {
+                    let (k, _) = entry?;
+                    if k.value().len() == 8 {
+                        let mut kk = [0u8; 8];
+                        kk.copy_from_slice(k.value());
+                        let h = u64::from_be_bytes(kk);
+                        if h > keep_below {
+                            keys.push(kk);
+                        }
+                    }
+                }
+                keys
+            };
+            {
+                let mut t = write.open_table(BLOCK_META)?;
+                for k in &block_meta_tail {
+                    t.remove(k.as_slice())?;
+                }
+            }
+
+            // TX_BY_ADDRESS, SETTLEMENT_*, SPENT_BY all key heights
+            // big-endian. Same shape; collect-then-remove.
+            wipe_tx_by_address_above(&write, keep_below)?;
+            wipe_settlements_above(&write, keep_below)?;
+            wipe_spent_by_above(&write, keep_below)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockApplyEvents — the typed payload `apply_block_events` consumes
+// ---------------------------------------------------------------------------
+
+pub struct BlockApplyEvents<'a> {
+    pub height: u64,
+    pub block_id: [u8; 32],
+    pub tx_count: u64,
+    pub timestamp: u64,
+    pub full_scan_complete: bool,
+    pub started_at: u64,
+    pub locks: &'a [ExtractedHtlcLock],
+    pub spends: &'a [ExtractedHtlcSpend],
+    pub settlements: &'a [SettlementRecord],
+    pub activity: &'a [AddressActivity],
+    pub spent_by: &'a [SpentByCacheEntry],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpentByCacheEntry {
+    pub prev_tx_id: [u8; 32],
+    pub output_index: u32,
+    pub spending_tx_id: [u8; 32],
+    pub input_index: u32,
+    pub block_height: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Within-txn helpers
+// ---------------------------------------------------------------------------
+
+fn upsert_htlc_within_txn(
+    write: &redb::WriteTransaction,
+    rec: &HtlcRecord,
+) -> Result<()> {
+    let primary_key = htlc_primary_key(&rec.lock_tx_id, rec.output_index);
+    let blob = bincode::serialize(rec)
+        .map_err(|e| Error::Storage(format!("encode htlc: {e}")))?;
+    let lock_h = rec.lock_block_height.unwrap_or(u64::MAX);
+
+    // Read prior, if any, so secondary index entries get rebuilt with
+    // up-to-date state. Materialize the bytes inside the inner scope —
+    // the AccessGuard returned by `get()` borrows the open table, so
+    // we need to copy out before the table itself is dropped.
+    let prior_bytes: Option<Vec<u8>> = {
+        let t = write.open_table(HTLC_FULL)?;
+        let opt = t.get(primary_key.as_slice())?;
+        opt.map(|g| g.value().to_vec())
+    };
+    let prior: Option<HtlcRecord> = match prior_bytes {
+        Some(b) => Some(
+            bincode::deserialize(&b)
+                .map_err(|e| Error::Storage(format!("decode prior: {e}")))?,
+        ),
+        None => None,
+    };
+
+    if let Some(prev) = prior.as_ref() {
+        forget_htlc_within_txn(write, &primary_key, prev)?;
+    }
+
+    // Primary
+    {
+        let mut t = write.open_table(HTLC_FULL)?;
+        t.insert(primary_key.as_slice(), blob.as_slice())?;
+    }
+    // Secondaries
+    {
+        let mut t = write.open_table(HTLC_BY_SENDER)?;
+        let k = sender_key(&rec.params.sender, lock_h, &rec.lock_tx_id, rec.output_index);
+        t.insert(k.as_slice(), ())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_RECEIVER)?;
+        let k = receiver_key(
+            &rec.params.receiver,
+            lock_h,
+            &rec.lock_tx_id,
+            rec.output_index,
+        );
+        t.insert(k.as_slice(), ())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_HASHLOCK)?;
+        let k = hashlock_key(&rec.params.hash_lock, &rec.lock_tx_id, rec.output_index);
+        t.insert(k.as_slice(), ())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_STATE)?;
+        let k = state_key(rec.state, lock_h, &rec.lock_tx_id, rec.output_index);
+        t.insert(k.as_slice(), ())?;
+    }
+    Ok(())
+}
+
+fn forget_htlc_within_txn(
+    write: &redb::WriteTransaction,
+    primary_key: &[u8; 36],
+    rec: &HtlcRecord,
+) -> Result<()> {
+    let lock_h = rec.lock_block_height.unwrap_or(u64::MAX);
+    {
+        let mut t = write.open_table(HTLC_FULL)?;
+        t.remove(primary_key.as_slice())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_SENDER)?;
+        let k = sender_key(&rec.params.sender, lock_h, &rec.lock_tx_id, rec.output_index);
+        let _ = t.remove(k.as_slice())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_RECEIVER)?;
+        let k = receiver_key(
+            &rec.params.receiver,
+            lock_h,
+            &rec.lock_tx_id,
+            rec.output_index,
+        );
+        let _ = t.remove(k.as_slice())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_HASHLOCK)?;
+        let k = hashlock_key(&rec.params.hash_lock, &rec.lock_tx_id, rec.output_index);
+        let _ = t.remove(k.as_slice())?;
+    }
+    {
+        let mut t = write.open_table(HTLC_BY_STATE)?;
+        let k = state_key(rec.state, lock_h, &rec.lock_tx_id, rec.output_index);
+        let _ = t.remove(k.as_slice())?;
+    }
+    Ok(())
+}
+
+fn advance_htlc_within_txn(
+    write: &redb::WriteTransaction,
+    spend: &ExtractedHtlcSpend,
+    height: u64,
+) -> Result<()> {
+    let primary_key = htlc_primary_key(&spend.lock_tx_id, spend.output_index);
+    let prior_bytes: Option<Vec<u8>> = {
+        let t = write.open_table(HTLC_FULL)?;
+        let opt = t.get(primary_key.as_slice())?;
+        opt.map(|g| g.value().to_vec())
+    };
+    let mut rec: HtlcRecord = match prior_bytes {
+        Some(b) => bincode::deserialize(&b)
+            .map_err(|e| Error::Storage(format!("decode htlc to advance: {e}")))?,
+        None => {
+            // Spend references an outpoint we never recorded as a lock
+            // — possible only if the lock predated the indexer's full
+            // scan. Skip; the address-activity layer still records the
+            // input.
+            return Ok(());
+        }
+    };
+    if matches!(rec.state, HtlcState::Claimed | HtlcState::Reclaimed) {
+        // Idempotent replay — already classified.
+        return Ok(());
+    }
+
+    // Drop prior secondaries before mutating.
+    forget_htlc_within_txn(write, &primary_key, &rec)?;
+
+    match &spend.arm {
+        HtlcSpendArm::Claim {
+            preimage,
+            spending_tx_id,
+            input_index,
+        } => {
+            rec.state = HtlcState::Claimed;
+            rec.claim = Some(exfer::covenants::htlc::HtlcClaimRecord {
+                tx_id: *spending_tx_id,
+                preimage: preimage.clone(),
+                block_height: height,
+                input_index: *input_index,
+            });
+        }
+        HtlcSpendArm::Reclaim {
+            spending_tx_id,
+            input_index,
+        } => {
+            rec.state = HtlcState::Reclaimed;
+            rec.reclaim = Some(exfer::covenants::htlc::HtlcReclaimRecord {
+                tx_id: *spending_tx_id,
+                block_height: height,
+                input_index: *input_index,
+            });
+        }
+    }
+    rec.last_indexed_height = height;
+    // Indexer is multi-tenant — it observes, doesn't own keys.
+    if rec.role != HtlcRole::Observer && rec.role != HtlcRole::Both {
+        // Preserve whatever role was originally recorded.
+    }
+    upsert_htlc_within_txn(write, &rec)
+}
+
+fn write_settlement_within_txn(
+    write: &redb::WriteTransaction,
+    sett: &SettlementRecord,
+) -> Result<()> {
+    let blob = bincode::serialize(sett)
+        .map_err(|e| Error::Storage(format!("encode settlement: {e}")))?;
+    {
+        let mut t = write.open_table(SETTLEMENT_BY_CONTRACT)?;
+        let k = settlement_by_contract_key(
+            &sett.contract_hash,
+            &sett.observer_address,
+            sett.block_height,
+            &sett.tx_id,
+        );
+        t.insert(k.as_slice(), blob.as_slice())?;
+    }
+    {
+        let mut t = write.open_table(SETTLEMENT_BY_ADDRESS)?;
+        let k = settlement_by_address_key(
+            &sett.observer_address,
+            &sett.contract_hash,
+            sett.block_height,
+            &sett.tx_id,
+        );
+        t.insert(k.as_slice(), ())?;
+    }
+    Ok(())
+}
+
+fn write_activity_within_txn(
+    write: &redb::WriteTransaction,
+    act: &AddressActivity,
+    height: u64,
+) -> Result<()> {
+    let mut t = write.open_table(TX_BY_ADDRESS)?;
+    let dir = if act.is_input {
+        DIR_INPUT_FROM
+    } else {
+        DIR_OUTPUT_TO
+    };
+    let k = tx_by_address_key(&act.address, height, &act.tx_id, dir);
+    let val = bincode::serialize(&ActivityValue {
+        amount: act.amount,
+        is_coinbase: act.is_coinbase,
+    })
+    .map_err(|e| Error::Storage(format!("encode activity: {e}")))?;
+    t.insert(k.as_slice(), val.as_slice())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActivityValue {
+    amount: u64,
+    is_coinbase: bool,
+}
+
+fn write_spent_by_within_txn(
+    write: &redb::WriteTransaction,
+    sb: &SpentByCacheEntry,
+) -> Result<()> {
+    let mut t = write.open_table(SPENT_BY)?;
+    let key = spent_by_key(&sb.prev_tx_id, sb.output_index);
+    let val = bincode::serialize(sb)
+        .map_err(|e| Error::Storage(format!("encode spent_by: {e}")))?;
+    t.insert(key.as_slice(), val.as_slice())?;
+    Ok(())
+}
+
+fn wipe_tx_by_address_above(
+    write: &redb::WriteTransaction,
+    keep_below: u64,
+) -> Result<()> {
+    let victims = {
+        let t = write.open_table(TX_BY_ADDRESS)?;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            // Layout: address (32) || height_be (8) || tx_id (32) || dir (1)
+            if k.value().len() >= 40 {
+                let h = u64::from_be_bytes(k.value()[32..40].try_into().unwrap());
+                if h > keep_below {
+                    v.push(k.value().to_vec());
+                }
+            }
+        }
+        v
+    };
+    let mut t = write.open_table(TX_BY_ADDRESS)?;
+    for k in &victims {
+        t.remove(k.as_slice())?;
+    }
+    Ok(())
+}
+
+fn wipe_settlements_above(
+    write: &redb::WriteTransaction,
+    keep_below: u64,
+) -> Result<()> {
+    // SETTLEMENT_BY_CONTRACT key: contract (32) || address (32) || height (8) || tx_id (32)
+    let victims_c = {
+        let t = write.open_table(SETTLEMENT_BY_CONTRACT)?;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            if k.value().len() >= 72 {
+                let h = u64::from_be_bytes(k.value()[64..72].try_into().unwrap());
+                if h > keep_below {
+                    v.push(k.value().to_vec());
+                }
+            }
+        }
+        v
+    };
+    {
+        let mut t = write.open_table(SETTLEMENT_BY_CONTRACT)?;
+        for k in &victims_c {
+            t.remove(k.as_slice())?;
+        }
+    }
+    // SETTLEMENT_BY_ADDRESS key: address (32) || contract (32) || height (8) || tx_id (32)
+    let victims_a = {
+        let t = write.open_table(SETTLEMENT_BY_ADDRESS)?;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            if k.value().len() >= 72 {
+                let h = u64::from_be_bytes(k.value()[64..72].try_into().unwrap());
+                if h > keep_below {
+                    v.push(k.value().to_vec());
+                }
+            }
+        }
+        v
+    };
+    {
+        let mut t = write.open_table(SETTLEMENT_BY_ADDRESS)?;
+        for k in &victims_a {
+            t.remove(k.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
+fn wipe_spent_by_above(
+    write: &redb::WriteTransaction,
+    keep_below: u64,
+) -> Result<()> {
+    let victims = {
+        let t = write.open_table(SPENT_BY)?;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for entry in t.iter()? {
+            let (k, val) = entry?;
+            let sb: SpentByCacheEntry = bincode::deserialize(val.value())
+                .map_err(|e| Error::Storage(format!("decode spent_by: {e}")))?;
+            if sb.block_height > keep_below {
+                v.push(k.value().to_vec());
+            }
+        }
+        v
+    };
+    let mut t = write.open_table(SPENT_BY)?;
+    for k in &victims {
+        t.remove(k.as_slice())?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Key encodings
+// ---------------------------------------------------------------------------
+
+fn htlc_primary_key(lock_tx_id: &[u8; 32], output_index: u32) -> [u8; 36] {
+    let mut k = [0u8; 36];
+    k[..32].copy_from_slice(lock_tx_id);
+    k[32..].copy_from_slice(&output_index.to_be_bytes());
+    k
+}
+
+fn sender_key(
+    sender: &[u8; 32],
+    lock_height: u64,
+    lock_tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 76] {
+    composite_key_address_height(sender, lock_height, lock_tx_id, output_index)
+}
+
+fn receiver_key(
+    receiver: &[u8; 32],
+    lock_height: u64,
+    lock_tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 76] {
+    composite_key_address_height(receiver, lock_height, lock_tx_id, output_index)
+}
+
+fn composite_key_address_height(
+    addr: &[u8; 32],
+    height: u64,
+    tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 76] {
+    let mut k = [0u8; 76];
+    k[..32].copy_from_slice(addr);
+    k[32..40].copy_from_slice(&height.to_be_bytes());
+    k[40..72].copy_from_slice(tx_id);
+    k[72..].copy_from_slice(&output_index.to_be_bytes());
+    k
+}
+
+fn hashlock_key(
+    hash_lock: &[u8; 32],
+    tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 68] {
+    let mut k = [0u8; 68];
+    k[..32].copy_from_slice(hash_lock);
+    k[32..64].copy_from_slice(tx_id);
+    k[64..].copy_from_slice(&output_index.to_be_bytes());
+    k
+}
+
+fn state_key(
+    state: HtlcState,
+    lock_height: u64,
+    lock_tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 45] {
+    let mut k = [0u8; 45];
+    k[0] = match state {
+        HtlcState::Locked => 0x00,
+        HtlcState::LockedExpired => 0x01,
+        HtlcState::Claimed => 0x02,
+        HtlcState::Reclaimed => 0x03,
+        HtlcState::Unknown => 0x04,
+    };
+    k[1..9].copy_from_slice(&lock_height.to_be_bytes());
+    k[9..41].copy_from_slice(lock_tx_id);
+    k[41..].copy_from_slice(&output_index.to_be_bytes());
+    k
+}
+
+fn tx_by_address_key(
+    address: &[u8; 32],
+    height: u64,
+    tx_id: &[u8; 32],
+    dir: u8,
+) -> [u8; 73] {
+    let mut k = [0u8; 73];
+    k[..32].copy_from_slice(address);
+    k[32..40].copy_from_slice(&height.to_be_bytes());
+    k[40..72].copy_from_slice(tx_id);
+    k[72] = dir;
+    k
+}
+
+fn settlement_by_contract_key(
+    contract: &[u8; 32],
+    address: &[u8; 32],
+    height: u64,
+    tx_id: &[u8; 32],
+) -> [u8; 104] {
+    let mut k = [0u8; 104];
+    k[..32].copy_from_slice(contract);
+    k[32..64].copy_from_slice(address);
+    k[64..72].copy_from_slice(&height.to_be_bytes());
+    k[72..].copy_from_slice(tx_id);
+    k
+}
+
+fn settlement_by_address_key(
+    address: &[u8; 32],
+    contract: &[u8; 32],
+    height: u64,
+    tx_id: &[u8; 32],
+) -> [u8; 104] {
+    let mut k = [0u8; 104];
+    k[..32].copy_from_slice(address);
+    k[32..64].copy_from_slice(contract);
+    k[64..72].copy_from_slice(&height.to_be_bytes());
+    k[72..].copy_from_slice(tx_id);
+    k
+}
+
+fn spent_by_key(prev_tx_id: &[u8; 32], output_index: u32) -> [u8; 36] {
+    htlc_primary_key(prev_tx_id, output_index)
 }
