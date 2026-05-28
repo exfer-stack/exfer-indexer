@@ -1,0 +1,6 @@
+target/
+Cargo.lock.local
+*.redb
+*.redb-tmp
+data/
+.DS_Store
