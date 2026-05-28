@@ -190,7 +190,14 @@ async fn htlc_status_returns_error_for_unknown() {
 async fn htlc_list_with_state_filter() {
     let ctx = make_ctx(0).await;
     let mut a = fixed_record([0x01; 32], 0, 10, HtlcState::Locked, [0x11; 32], [0x22; 32]);
-    let mut b = fixed_record([0x02; 32], 0, 20, HtlcState::Claimed, [0x11; 32], [0x22; 32]);
+    let mut b = fixed_record(
+        [0x02; 32],
+        0,
+        20,
+        HtlcState::Claimed,
+        [0x11; 32],
+        [0x22; 32],
+    );
     let _ = (&mut a, &mut b);
     seed_htlc(&ctx, a).await;
     seed_htlc(&ctx, b).await;
@@ -447,15 +454,9 @@ async fn get_address_history_returns_activity_rows() {
     let arr = v["history"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
     // ordered by tx_id within the same height
-    assert_eq!(
-        arr[0]["tx_id"].as_str().unwrap(),
-        hex::encode([0xAA; 32])
-    );
+    assert_eq!(arr[0]["tx_id"].as_str().unwrap(), hex::encode([0xAA; 32]));
     assert_eq!(arr[0]["direction"].as_str(), Some("output"));
-    assert_eq!(
-        arr[1]["tx_id"].as_str().unwrap(),
-        hex::encode([0xBB; 32])
-    );
+    assert_eq!(arr[1]["tx_id"].as_str().unwrap(), hex::encode([0xBB; 32]));
     assert_eq!(arr[1]["direction"].as_str(), Some("input"));
 }
 
@@ -500,7 +501,10 @@ async fn get_output_spent_by_hits_local_cache_first() {
     .await
     .unwrap();
     assert_eq!(v["spent"].as_bool(), Some(true));
-    assert_eq!(v["spending_tx_id"].as_str(), Some(hex::encode([0xBB; 32])).as_deref());
+    assert_eq!(
+        v["spending_tx_id"].as_str(),
+        Some(hex::encode([0xBB; 32])).as_deref()
+    );
     assert_eq!(v["block_height"].as_u64(), Some(7));
     assert_eq!(v["source"].as_str(), Some("indexer-cache"));
 }
@@ -512,12 +516,9 @@ async fn get_output_spent_by_hits_local_cache_first() {
 #[tokio::test]
 async fn unknown_method_returns_method_not_found() {
     let ctx = make_ctx(0).await;
-    let err = dispatch(
-        &ctx.state,
-        rpc("definitely_not_a_method", json!({})),
-    )
-    .await
-    .unwrap_err();
+    let err = dispatch(&ctx.state, rpc("definitely_not_a_method", json!({})))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, exfer_indexer::error::Error::UnknownMethod(_)),
         "got {err:?}"
@@ -534,8 +535,5 @@ async fn bad_address_hex_is_rejected() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(
-        err,
-        exfer_indexer::error::Error::BadAddressLen(_)
-    ));
+    assert!(matches!(err, exfer_indexer::error::Error::BadAddressLen(_)));
 }

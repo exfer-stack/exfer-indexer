@@ -54,7 +54,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if cfg.no_follower {
         tracing::warn!("follower disabled by --no-follower");
     } else {
-        let _ = follower.spawn();
+        // Spawn the follower as a fire-and-forget background task. We
+        // don't keep the JoinHandle: the task lives for the lifetime of
+        // the process, and tokio will cancel it on runtime shutdown.
+        std::mem::drop(follower.spawn());
     }
 
     let api = ApiState {
@@ -62,7 +65,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         node,
         tip_rx,
     };
-    let token = cfg.auth_token.as_ref().map(|s| Arc::new(s.as_bytes().to_vec()));
+    let token = cfg
+        .auth_token
+        .as_ref()
+        .map(|s| Arc::new(s.as_bytes().to_vec()));
     let app_state = AppState { api, token };
 
     let app = Router::new()
@@ -180,7 +186,10 @@ async fn handle_single(state: &AppState, body: Value) -> Value {
         Err(e) => return rpc_error(None, &Error::InvalidRequest(e.to_string())),
     };
     if req.jsonrpc != "2.0" {
-        return rpc_error(req.id, &Error::InvalidRequest("jsonrpc must be \"2.0\"".into()));
+        return rpc_error(
+            req.id,
+            &Error::InvalidRequest("jsonrpc must be \"2.0\"".into()),
+        );
     }
     let id = req.id.clone();
     match dispatch(&state.api, req).await {

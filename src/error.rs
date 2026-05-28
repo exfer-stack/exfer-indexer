@@ -40,11 +40,10 @@ pub enum Error {
 
     /// Indexer has not yet observed the requested height — caller can
     /// retry once the follower catches up.
-    #[error("requested data not yet indexed (follower at height {follower_height}, asked for {asked})")]
-    NotYetIndexed {
-        follower_height: u64,
-        asked: u64,
-    },
+    #[error(
+        "requested data not yet indexed (follower at height {follower_height}, asked for {asked})"
+    )]
+    NotYetIndexed { follower_height: u64, asked: u64 },
 
     /// Upstream node unreachable / timing out / returning RPC errors.
     #[error("upstream node unreachable: {0}")]

@@ -182,8 +182,7 @@ async fn htlc_list(state: &ApiState, params: Value) -> Result<Value> {
             cursor: None,
         }
     } else {
-        serde_json::from_value(params)
-            .map_err(|e| Error::BadParams(format!("htlc_list: {e}")))?
+        serde_json::from_value(params).map_err(|e| Error::BadParams(format!("htlc_list: {e}")))?
     };
     let limit = p
         .limit
@@ -288,7 +287,13 @@ async fn list_settlements(state: &ApiState, params: Value) -> Result<Value> {
     };
     let db = state.db.clone();
     let (rows, next) = tokio::task::spawn_blocking(move || {
-        db.list_settlements(&address, contract_hash.as_ref(), p.since_height, limit, cursor)
+        db.list_settlements(
+            &address,
+            contract_hash.as_ref(),
+            p.since_height,
+            limit,
+            cursor,
+        )
     })
     .await
     .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
@@ -334,9 +339,10 @@ async fn contract_stats(state: &ApiState, params: Value) -> Result<Value> {
         None => None,
     };
     let db = state.db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.contract_stats(&address, contract_hash.as_ref()))
-        .await
-        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    let rows =
+        tokio::task::spawn_blocking(move || db.contract_stats(&address, contract_hash.as_ref()))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
 
     let stats: Vec<ContractStatsRow> = rows
         .iter()
@@ -345,11 +351,7 @@ async fn contract_stats(state: &ApiState, params: Value) -> Result<Value> {
             total: s.total,
             succeeded: s.succeeded,
             refunded: s.refunded,
-            avg_settle_blocks: if s.total == 0 {
-                0
-            } else {
-                s.sum_settle_blocks / s.total
-            },
+            avg_settle_blocks: s.sum_settle_blocks.checked_div(s.total).unwrap_or(0),
             last_settled_at_height: s.last_settled_at_height,
         })
         .collect();
@@ -458,7 +460,11 @@ async fn get_output_spent_by(state: &ApiState, params: Value) -> Result<Value> {
     //    in workflow B's first commit (`get_output_spent_by`); if the
     //    upstream doesn't have it (older binary), surface as
     //    `{spent: false}` since we have no other source of truth.
-    match state.node.get_output_spent_by(&p.tx_id, p.output_index).await {
+    match state
+        .node
+        .get_output_spent_by(&p.tx_id, p.output_index)
+        .await
+    {
         Ok(SpentByResponse::Spent {
             spending_tx_id,
             input_index,

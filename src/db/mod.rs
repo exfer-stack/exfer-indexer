@@ -202,7 +202,7 @@ use schema::{
 // Follower checkpoint
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FollowerMeta {
     pub last_indexed_height: u64,
     pub last_indexed_block_id: [u8; 32],
@@ -210,17 +210,6 @@ pub struct FollowerMeta {
     /// Unix seconds when the follower first started. Stable across
     /// restarts; only the very first save writes it.
     pub started_at: u64,
-}
-
-impl Default for FollowerMeta {
-    fn default() -> Self {
-        Self {
-            last_indexed_height: 0,
-            last_indexed_block_id: [0u8; 32],
-            full_scan_complete: false,
-            started_at: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,11 +261,7 @@ impl Db {
     /// Read a single HTLC record by primary key. Returns `None` if
     /// the indexer hasn't seen it (still in mempool, or pre-dates the
     /// follower's scan window).
-    pub fn get_htlc(
-        &self,
-        lock_tx_id: &[u8; 32],
-        output_index: u32,
-    ) -> Result<Option<HtlcRecord>> {
+    pub fn get_htlc(&self, lock_tx_id: &[u8; 32], output_index: u32) -> Result<Option<HtlcRecord>> {
         let read = self.db.begin_read()?;
         let t = read.open_table(HTLC_FULL)?;
         let key = htlc_primary_key(lock_tx_id, output_index);
@@ -285,10 +270,11 @@ impl Db {
             opt.map(|g| g.value().to_vec())
         };
         match bytes_opt {
-            Some(b) => Ok(Some(
-                bincode::deserialize(&b)
-                    .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?,
-            )),
+            Some(b) => {
+                Ok(Some(bincode::deserialize(&b).map_err(|e| {
+                    Error::Storage(format!("decode htlc: {e}"))
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -362,8 +348,7 @@ impl Db {
             // Walk by_sender and by_receiver prefixes, deduping by
             // primary key. Bounded scan: each secondary range yields
             // at most one entry per primary key in the relevant slice.
-            let mut keys: std::collections::BTreeSet<[u8; 36]> =
-                std::collections::BTreeSet::new();
+            let mut keys: std::collections::BTreeSet<[u8; 36]> = std::collections::BTreeSet::new();
 
             for table in [&HTLC_BY_SENDER, &HTLC_BY_RECEIVER] {
                 let t = read.open_table(*table)?;
@@ -455,7 +440,10 @@ impl Db {
         since_height: Option<u64>,
         limit: usize,
         cursor: Option<SettlementCursor>,
-    ) -> Result<(Vec<crate::extract::SettlementRecord>, Option<SettlementCursor>)> {
+    ) -> Result<(
+        Vec<crate::extract::SettlementRecord>,
+        Option<SettlementCursor>,
+    )> {
         let read = self.db.begin_read()?;
         let by_contract = read.open_table(SETTLEMENT_BY_CONTRACT)?;
 
@@ -654,10 +642,11 @@ impl Db {
             opt.map(|g| g.value().to_vec())
         };
         match bytes_opt {
-            Some(b) => Ok(Some(
-                bincode::deserialize(&b)
-                    .map_err(|e| Error::Storage(format!("decode spent_by: {e}")))?,
-            )),
+            Some(b) => {
+                Ok(Some(bincode::deserialize(&b).map_err(|e| {
+                    Error::Storage(format!("decode spent_by: {e}"))
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -675,8 +664,8 @@ impl Db {
     }
 
     pub fn save_meta(&self, meta: &FollowerMeta) -> Result<()> {
-        let blob = bincode::serialize(meta)
-            .map_err(|e| Error::Storage(format!("encode meta: {e}")))?;
+        let blob =
+            bincode::serialize(meta).map_err(|e| Error::Storage(format!("encode meta: {e}")))?;
         let write = self.db.begin_write()?;
         {
             let mut table = write.open_table(CHAIN_TIP)?;
@@ -866,13 +855,9 @@ pub struct SpentByCacheEntry {
 // Within-txn helpers
 // ---------------------------------------------------------------------------
 
-fn upsert_htlc_within_txn(
-    write: &redb::WriteTransaction,
-    rec: &HtlcRecord,
-) -> Result<()> {
+fn upsert_htlc_within_txn(write: &redb::WriteTransaction, rec: &HtlcRecord) -> Result<()> {
     let primary_key = htlc_primary_key(&rec.lock_tx_id, rec.output_index);
-    let blob = bincode::serialize(rec)
-        .map_err(|e| Error::Storage(format!("encode htlc: {e}")))?;
+    let blob = bincode::serialize(rec).map_err(|e| Error::Storage(format!("encode htlc: {e}")))?;
     let lock_h = rec.lock_block_height.unwrap_or(u64::MAX);
 
     // Read prior, if any, so secondary index entries get rebuilt with
@@ -886,8 +871,7 @@ fn upsert_htlc_within_txn(
     };
     let prior: Option<HtlcRecord> = match prior_bytes {
         Some(b) => Some(
-            bincode::deserialize(&b)
-                .map_err(|e| Error::Storage(format!("decode prior: {e}")))?,
+            bincode::deserialize(&b).map_err(|e| Error::Storage(format!("decode prior: {e}")))?,
         ),
         None => None,
     };
@@ -904,7 +888,12 @@ fn upsert_htlc_within_txn(
     // Secondaries
     {
         let mut t = write.open_table(HTLC_BY_SENDER)?;
-        let k = sender_key(&rec.params.sender, lock_h, &rec.lock_tx_id, rec.output_index);
+        let k = sender_key(
+            &rec.params.sender,
+            lock_h,
+            &rec.lock_tx_id,
+            rec.output_index,
+        );
         t.insert(k.as_slice(), ())?;
     }
     {
@@ -942,7 +931,12 @@ fn forget_htlc_within_txn(
     }
     {
         let mut t = write.open_table(HTLC_BY_SENDER)?;
-        let k = sender_key(&rec.params.sender, lock_h, &rec.lock_tx_id, rec.output_index);
+        let k = sender_key(
+            &rec.params.sender,
+            lock_h,
+            &rec.lock_tx_id,
+            rec.output_index,
+        );
         let _ = t.remove(k.as_slice())?;
     }
     {
@@ -1036,8 +1030,8 @@ fn write_settlement_within_txn(
     write: &redb::WriteTransaction,
     sett: &SettlementRecord,
 ) -> Result<()> {
-    let blob = bincode::serialize(sett)
-        .map_err(|e| Error::Storage(format!("encode settlement: {e}")))?;
+    let blob =
+        bincode::serialize(sett).map_err(|e| Error::Storage(format!("encode settlement: {e}")))?;
     {
         let mut t = write.open_table(SETTLEMENT_BY_CONTRACT)?;
         let k = settlement_by_contract_key(
@@ -1088,22 +1082,16 @@ struct ActivityValue {
     is_coinbase: bool,
 }
 
-fn write_spent_by_within_txn(
-    write: &redb::WriteTransaction,
-    sb: &SpentByCacheEntry,
-) -> Result<()> {
+fn write_spent_by_within_txn(write: &redb::WriteTransaction, sb: &SpentByCacheEntry) -> Result<()> {
     let mut t = write.open_table(SPENT_BY)?;
     let key = spent_by_key(&sb.prev_tx_id, sb.output_index);
-    let val = bincode::serialize(sb)
-        .map_err(|e| Error::Storage(format!("encode spent_by: {e}")))?;
+    let val =
+        bincode::serialize(sb).map_err(|e| Error::Storage(format!("encode spent_by: {e}")))?;
     t.insert(key.as_slice(), val.as_slice())?;
     Ok(())
 }
 
-fn wipe_tx_by_address_above(
-    write: &redb::WriteTransaction,
-    keep_below: u64,
-) -> Result<()> {
+fn wipe_tx_by_address_above(write: &redb::WriteTransaction, keep_below: u64) -> Result<()> {
     let victims = {
         let t = write.open_table(TX_BY_ADDRESS)?;
         let mut v: Vec<Vec<u8>> = Vec::new();
@@ -1126,10 +1114,7 @@ fn wipe_tx_by_address_above(
     Ok(())
 }
 
-fn wipe_settlements_above(
-    write: &redb::WriteTransaction,
-    keep_below: u64,
-) -> Result<()> {
+fn wipe_settlements_above(write: &redb::WriteTransaction, keep_below: u64) -> Result<()> {
     // SETTLEMENT_BY_CONTRACT key: contract (32) || address (32) || height (8) || tx_id (32)
     let victims_c = {
         let t = write.open_table(SETTLEMENT_BY_CONTRACT)?;
@@ -1175,10 +1160,7 @@ fn wipe_settlements_above(
     Ok(())
 }
 
-fn wipe_spent_by_above(
-    write: &redb::WriteTransaction,
-    keep_below: u64,
-) -> Result<()> {
+fn wipe_spent_by_above(write: &redb::WriteTransaction, keep_below: u64) -> Result<()> {
     let victims = {
         let t = write.open_table(SPENT_BY)?;
         let mut v: Vec<Vec<u8>> = Vec::new();
@@ -1242,11 +1224,7 @@ fn composite_key_address_height(
     k
 }
 
-fn hashlock_key(
-    hash_lock: &[u8; 32],
-    tx_id: &[u8; 32],
-    output_index: u32,
-) -> [u8; 68] {
+fn hashlock_key(hash_lock: &[u8; 32], tx_id: &[u8; 32], output_index: u32) -> [u8; 68] {
     let mut k = [0u8; 68];
     k[..32].copy_from_slice(hash_lock);
     k[32..64].copy_from_slice(tx_id);
@@ -1274,12 +1252,7 @@ fn state_key(
     k
 }
 
-fn tx_by_address_key(
-    address: &[u8; 32],
-    height: u64,
-    tx_id: &[u8; 32],
-    dir: u8,
-) -> [u8; 73] {
+fn tx_by_address_key(address: &[u8; 32], height: u64, tx_id: &[u8; 32], dir: u8) -> [u8; 73] {
     let mut k = [0u8; 73];
     k[..32].copy_from_slice(address);
     k[32..40].copy_from_slice(&height.to_be_bytes());

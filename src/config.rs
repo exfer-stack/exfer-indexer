@@ -20,7 +20,11 @@ pub struct Config {
 
     /// URL(s) of the upstream Exfer node JSON-RPC. Comma-separated for
     /// round-robin + failover.
-    #[arg(long, env = "EXFER_INDEXER_NODE_RPC", default_value = "http://127.0.0.1:9334")]
+    #[arg(
+        long,
+        env = "EXFER_INDEXER_NODE_RPC",
+        default_value = "http://127.0.0.1:9334"
+    )]
     pub node_rpc: String,
 
     /// Local data directory. The redb file lives at `<datadir>/index.redb`.
@@ -39,7 +43,11 @@ pub struct Config {
     pub poll_secs: u64,
 
     /// Upstream RPC request timeout (seconds).
-    #[arg(long, env = "EXFER_INDEXER_UPSTREAM_TIMEOUT_SECS", default_value_t = 30)]
+    #[arg(
+        long,
+        env = "EXFER_INDEXER_UPSTREAM_TIMEOUT_SECS",
+        default_value_t = 30
+    )]
     pub upstream_timeout_secs: u64,
 
     /// Disable the follower task on startup. The HTTP server still

@@ -7,9 +7,7 @@
 //! sense that re-applying the same block yields the same final
 //! state byte-for-byte.
 
-use exfer::covenants::htlc::{
-    HtlcClaimRecord, HtlcParams, HtlcRecord, HtlcRole, HtlcState,
-};
+use exfer::covenants::htlc::{HtlcClaimRecord, HtlcParams, HtlcRecord, HtlcRole, HtlcState};
 use exfer_indexer::db::{BlockApplyEvents, Db, SpentByCacheEntry};
 use exfer_indexer::extract::{
     AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, HtlcSpendArm, SettlementRecord,
@@ -148,7 +146,11 @@ fn claim_spend_advances_state_and_keeps_preimage() {
     // We rely on htlc_count being 1 + load_meta showing height 51.
     let meta = db.load_meta().unwrap();
     assert_eq!(meta.last_indexed_height, 51);
-    assert_eq!(db.htlc_count().unwrap(), 1, "claim must update, not duplicate");
+    assert_eq!(
+        db.htlc_count().unwrap(),
+        1,
+        "claim must update, not duplicate"
+    );
 }
 
 #[test]

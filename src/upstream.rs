@@ -107,10 +107,8 @@ impl NodeClient {
                         }
                     };
                     if let Some(err) = v.get("error") {
-                        let code = err
-                            .get("code")
-                            .and_then(|c| c.as_i64())
-                            .unwrap_or(-32603) as i32;
+                        let code =
+                            err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32603) as i32;
                         let message = err
                             .get("message")
                             .and_then(|m| m.as_str())
@@ -139,27 +137,24 @@ impl NodeClient {
 
     pub async fn get_block_height(&self) -> Result<TipResponse> {
         let v = self.call("get_block_height", serde_json::json!({})).await?;
-        serde_json::from_value(v).map_err(|e| {
-            Error::Internal(format!("get_block_height: decode: {e}"))
-        })
+        serde_json::from_value(v)
+            .map_err(|e| Error::Internal(format!("get_block_height: decode: {e}")))
     }
 
     pub async fn get_block_by_height(&self, height: u64) -> Result<BlockSummary> {
         let v = self
             .call("get_block", serde_json::json!({ "height": height }))
             .await?;
-        serde_json::from_value(v).map_err(|e| {
-            Error::Internal(format!("get_block_by_height: decode: {e}"))
-        })
+        serde_json::from_value(v)
+            .map_err(|e| Error::Internal(format!("get_block_by_height: decode: {e}")))
     }
 
     pub async fn get_transaction(&self, tx_id_hex: &str) -> Result<TxStatus> {
         let v = self
             .call("get_transaction", serde_json::json!({ "hash": tx_id_hex }))
             .await?;
-        serde_json::from_value(v).map_err(|e| {
-            Error::Internal(format!("get_transaction: decode: {e}"))
-        })
+        serde_json::from_value(v)
+            .map_err(|e| Error::Internal(format!("get_transaction: decode: {e}")))
     }
 
     /// Node-side spent-by lookup (added by the workflow B node PR).
@@ -177,9 +172,8 @@ impl NodeClient {
                 serde_json::json!({ "tx_id": tx_id_hex, "output_index": output_index }),
             )
             .await?;
-        serde_json::from_value(v).map_err(|e| {
-            Error::Internal(format!("get_output_spent_by: decode: {e}"))
-        })
+        serde_json::from_value(v)
+            .map_err(|e| Error::Internal(format!("get_output_spent_by: decode: {e}")))
     }
 }
 

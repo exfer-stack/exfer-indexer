@@ -4,10 +4,8 @@
 //! No I/O. Pure functions of `(Block, Vec<Transaction>)` → events.
 //! The follower handles fetching; this module handles interpretation.
 
-use exfer::covenants::htlc::{
-    try_parse_htlc, HtlcParams, HtlcRecord, HtlcRole, HtlcState,
-};
-use exfer::script::serialize::{merkle_hash, deserialize_program};
+use exfer::covenants::htlc::{try_parse_htlc, HtlcParams, HtlcRecord, HtlcRole, HtlcState};
+use exfer::script::serialize::{deserialize_program, merkle_hash};
 use exfer::types::transaction::Transaction;
 use exfer::types::Hash256;
 use serde::{Deserialize, Serialize};
@@ -91,11 +89,7 @@ pub struct SettlementRecord {
 
 /// Best-effort extraction. Anything we can't classify is silently
 /// skipped — the indexer never crashes on malformed chain data.
-pub fn extract_from_tx(
-    tx: &Transaction,
-    height: u64,
-    last_indexed_height: u64,
-) -> ExtractedTx {
+pub fn extract_from_tx(tx: &Transaction, height: u64, last_indexed_height: u64) -> ExtractedTx {
     let tx_id = match tx.tx_id() {
         Ok(t) => *t.as_bytes(),
         Err(_) => return ExtractedTx::default(),
@@ -239,9 +233,7 @@ fn extract_claim_preimage(witness: &[u8]) -> Option<Vec<u8>> {
     if witness.len() < 7 {
         return None;
     }
-    if witness[0] != VALUE_TAG_LEFT
-        || witness[1] != VALUE_TAG_UNIT
-        || witness[2] != VALUE_TAG_BYTES
+    if witness[0] != VALUE_TAG_LEFT || witness[1] != VALUE_TAG_UNIT || witness[2] != VALUE_TAG_BYTES
     {
         return None;
     }
@@ -269,10 +261,7 @@ pub fn contract_hash_of_script(script: &[u8]) -> Option<Hash256> {
 /// address is most meaningful from this side's perspective; for the
 /// indexer (multi-tenant, no owned keys), we record one row per side
 /// — see [`settlements_for_settled_htlc`].
-pub fn settlements_for_settled_htlc(
-    rec: &HtlcRecord,
-    block_height: u64,
-) -> Vec<SettlementRecord> {
+pub fn settlements_for_settled_htlc(rec: &HtlcRecord, block_height: u64) -> Vec<SettlementRecord> {
     // Compute contract_hash from the canonical template. The script
     // bytes aren't on the record (would bloat it), so reconstruct via
     // the public template constructor + serialize, then Merkle-hash.
@@ -285,32 +274,33 @@ pub fn settlements_for_settled_htlc(
     let contract_hash = merkle_hash(&program).0;
 
     let outcome = rec.state;
-    let mut out = Vec::with_capacity(2);
-    // Sender's perspective: counterparty = receiver
-    out.push(SettlementRecord {
-        tx_id: settled_tx_id(rec).unwrap_or(rec.lock_tx_id),
-        block_height,
-        contract_hash,
-        outcome,
-        observer_address: derive_address_from_pubkey(&rec.params.sender),
-        counterparty: derive_address_from_pubkey(&rec.params.receiver),
-        amount: rec.amount,
-        lock_tx_id: rec.lock_tx_id,
-        lock_output_index: rec.output_index,
-    });
-    // Receiver's perspective: counterparty = sender
-    out.push(SettlementRecord {
-        tx_id: settled_tx_id(rec).unwrap_or(rec.lock_tx_id),
-        block_height,
-        contract_hash,
-        outcome,
-        observer_address: derive_address_from_pubkey(&rec.params.receiver),
-        counterparty: derive_address_from_pubkey(&rec.params.sender),
-        amount: rec.amount,
-        lock_tx_id: rec.lock_tx_id,
-        lock_output_index: rec.output_index,
-    });
-    out
+    let tx_id = settled_tx_id(rec).unwrap_or(rec.lock_tx_id);
+    vec![
+        // Sender's perspective: counterparty = receiver.
+        SettlementRecord {
+            tx_id,
+            block_height,
+            contract_hash,
+            outcome,
+            observer_address: derive_address_from_pubkey(&rec.params.sender),
+            counterparty: derive_address_from_pubkey(&rec.params.receiver),
+            amount: rec.amount,
+            lock_tx_id: rec.lock_tx_id,
+            lock_output_index: rec.output_index,
+        },
+        // Receiver's perspective: counterparty = sender.
+        SettlementRecord {
+            tx_id,
+            block_height,
+            contract_hash,
+            outcome,
+            observer_address: derive_address_from_pubkey(&rec.params.receiver),
+            counterparty: derive_address_from_pubkey(&rec.params.sender),
+            amount: rec.amount,
+            lock_tx_id: rec.lock_tx_id,
+            lock_output_index: rec.output_index,
+        },
+    ]
 }
 
 fn settled_tx_id(rec: &HtlcRecord) -> Option<[u8; 32]> {

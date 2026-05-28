@@ -46,11 +46,7 @@ pub struct Follower {
 }
 
 impl Follower {
-    pub fn new(
-        db: Arc<Db>,
-        node: NodeClient,
-        cfg: Config,
-    ) -> (Arc<Self>, watch::Receiver<u64>) {
+    pub fn new(db: Arc<Db>, node: NodeClient, cfg: Config) -> (Arc<Self>, watch::Receiver<u64>) {
         let initial = db.load_meta().map(|m| m.last_indexed_height).unwrap_or(0);
         let (tip_tx, tip_rx) = watch::channel(initial);
         (
@@ -94,7 +90,10 @@ impl Follower {
 
         // Reorg detection.
         if meta.last_indexed_height > 0 {
-            let on_chain = self.node.get_block_by_height(meta.last_indexed_height).await?;
+            let on_chain = self
+                .node
+                .get_block_by_height(meta.last_indexed_height)
+                .await?;
             let on_chain_id = decode_hex32(&on_chain.block_id)?;
             if on_chain_id != meta.last_indexed_block_id {
                 let ancestor = self.find_common_ancestor(meta.last_indexed_height).await?;
@@ -193,9 +192,8 @@ impl Follower {
         // already indexed, build a per-side settlement record.
         for spend in &spends {
             if let Ok(Some(blob)) = self.peek_htlc(&spend.lock_tx_id, spend.output_index) {
-                let mut rec: exfer::covenants::htlc::HtlcRecord =
-                    bincode::deserialize(&blob)
-                        .map_err(|e| Error::Storage(format!("decode peek htlc: {e}")))?;
+                let mut rec: exfer::covenants::htlc::HtlcRecord = bincode::deserialize(&blob)
+                    .map_err(|e| Error::Storage(format!("decode peek htlc: {e}")))?;
                 // Speculatively set the outcome state so the
                 // settlements_for_settled_htlc output reflects what
                 // will be in the index after apply.
@@ -228,11 +226,7 @@ impl Follower {
         self.db.apply_block_events(events)
     }
 
-    fn peek_htlc(
-        &self,
-        lock_tx_id: &[u8; 32],
-        output_index: u32,
-    ) -> Result<Option<Vec<u8>>> {
+    fn peek_htlc(&self, lock_tx_id: &[u8; 32], output_index: u32) -> Result<Option<Vec<u8>>> {
         use crate::db::schema::HTLC_FULL;
         let read = self.db.raw().begin_read()?;
         let t = read.open_table(HTLC_FULL)?;
@@ -243,21 +237,18 @@ impl Follower {
         Ok(opt.map(|g| g.value().to_vec()))
     }
 
-    /// Walk backwards one block at a time on the node side. The node
-    /// is the source of truth — whatever block_id it now reports at
-    /// height H is canonical for H. We return as soon as we reach
-    /// the height the indexer has not yet touched (or genesis).
+    /// Walk back one block on the node side. The node is the source of
+    /// truth — whatever block_id it now reports at height H is
+    /// canonical for H. Genesis (height 0) is the unconditional
+    /// fallback.
     async fn find_common_ancestor(&self, from_height: u64) -> Result<(u64, [u8; 32])> {
-        let mut h = from_height;
-        loop {
-            if h == 0 {
-                let b = self.node.get_block_by_height(0).await?;
-                return Ok((0, decode_hex32(&b.block_id)?));
-            }
-            h -= 1;
-            let b = self.node.get_block_by_height(h).await?;
-            return Ok((h, decode_hex32(&b.block_id)?));
+        if from_height == 0 {
+            let b = self.node.get_block_by_height(0).await?;
+            return Ok((0, decode_hex32(&b.block_id)?));
         }
+        let h = from_height - 1;
+        let b = self.node.get_block_by_height(h).await?;
+        Ok((h, decode_hex32(&b.block_id)?))
     }
 }
 
