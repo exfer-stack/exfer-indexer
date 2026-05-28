@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use base64::Engine;
 use exfer::covenants::htlc::{HtlcRecord, HtlcRole, HtlcState};
 use redb::{ReadableTable, ReadableTableMetadata};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,170 @@ use crate::error::{Error, Result};
 use crate::extract::{
     AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, HtlcSpendArm, SettlementRecord,
 };
+
+// ---------------------------------------------------------------------------
+// Filter + cursor types used by query helpers
+// ---------------------------------------------------------------------------
+
+/// Filter for [`Db::list_htlcs`]. Multiple criteria apply conjunctively.
+#[derive(Debug, Clone, Default)]
+pub struct HtlcFilter {
+    pub role: Option<HtlcRole>,
+    /// Empty == any state.
+    pub states: Vec<HtlcState>,
+    /// Restrict to entries where `address` matches either the sender
+    /// or receiver pubkey. (The indexer indexes raw pubkeys, not
+    /// derived addresses — see `htlc_by_sender` / `htlc_by_receiver`
+    /// secondary indexes.)
+    pub address: Option<[u8; 32]>,
+    pub since_height: Option<u64>,
+}
+
+/// Opaque pagination cursor for [`Db::list_htlcs`]. Encoded as
+/// `base64url([height_u64_be(8); lock_tx_id(32); output_index_u32_be(4)])`.
+/// 44 bytes pre-encode — same format as exfer-walletd's cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    pub lock_height: u64,
+    pub lock_tx_id: [u8; 32],
+    pub output_index: u32,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        let mut buf = [0u8; 44];
+        buf[..8].copy_from_slice(&self.lock_height.to_be_bytes());
+        buf[8..40].copy_from_slice(&self.lock_tx_id);
+        buf[40..].copy_from_slice(&self.output_index.to_be_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    }
+
+    pub fn decode(s: &str) -> Result<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| Error::BadParams(format!("invalid cursor: {e}")))?;
+        if bytes.len() != 44 {
+            return Err(Error::BadParams(format!(
+                "invalid cursor: expected 44 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let lock_height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        let mut lock_tx_id = [0u8; 32];
+        lock_tx_id.copy_from_slice(&bytes[8..40]);
+        let output_index = u32::from_be_bytes(bytes[40..].try_into().unwrap());
+        Ok(Cursor {
+            lock_height,
+            lock_tx_id,
+            output_index,
+        })
+    }
+}
+
+/// Cursor for `list_settlements` / `list_address_history` — these
+/// orderings key on `(block_height, tx_id)` not `(block_height,
+/// tx_id, output_index)`. 40 bytes pre-encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementCursor {
+    pub height: u64,
+    pub tx_id: [u8; 32],
+}
+
+impl SettlementCursor {
+    pub fn encode(&self) -> String {
+        let mut buf = [0u8; 40];
+        buf[..8].copy_from_slice(&self.height.to_be_bytes());
+        buf[8..].copy_from_slice(&self.tx_id);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    }
+
+    pub fn decode(s: &str) -> Result<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| Error::BadParams(format!("invalid cursor: {e}")))?;
+        if bytes.len() != 40 {
+            return Err(Error::BadParams(format!(
+                "invalid cursor: expected 40 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&bytes[8..]);
+        Ok(SettlementCursor { height, tx_id })
+    }
+}
+
+/// Identical encoding to [`SettlementCursor`]; separate type for
+/// type-level distinction at the API boundary.
+pub type HistoryCursor = SettlementCursor;
+
+/// One row returned by [`Db::contract_stats`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStats {
+    pub contract_hash: [u8; 32],
+    pub total: u64,
+    pub succeeded: u64,
+    pub refunded: u64,
+    /// Sum of `block_height` across every settlement counted. The
+    /// avg-settle-block ratio is computed by the RPC layer.
+    pub sum_settle_blocks: u64,
+    pub last_settled_at_height: Option<u64>,
+}
+
+/// One row returned by [`Db::list_address_history`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressHistoryRow {
+    pub block_height: u64,
+    pub tx_id: [u8; 32],
+    pub amount: u64,
+    pub is_input: bool,
+    pub is_coinbase: bool,
+}
+
+fn filter_matches(rec: &HtlcRecord, f: &HtlcFilter) -> bool {
+    if let Some(role) = f.role {
+        if rec.role != role {
+            return false;
+        }
+    }
+    if !f.states.is_empty() && !f.states.contains(&rec.state) {
+        return false;
+    }
+    if let Some(addr) = f.address {
+        if rec.params.sender != addr && rec.params.receiver != addr {
+            return false;
+        }
+    }
+    if let Some(min) = f.since_height {
+        if rec.lock_block_height.unwrap_or(u64::MAX) < min {
+            return false;
+        }
+    }
+    true
+}
+
+fn settlement_range_for(
+    address: &[u8; 32],
+    contract_hash: Option<&[u8; 32]>,
+) -> ([u8; 104], [u8; 104]) {
+    // SETTLEMENT_BY_CONTRACT key: [contract(32); address(32); height(8); tx_id(32)]
+    // We scan by contract prefix if `contract_hash` is supplied;
+    // otherwise the caller pre-filters by address from the by_address
+    // table (this helper just shapes the lo/hi bounds).
+    let mut lo = [0u8; 104];
+    let mut hi = [0xFFu8; 104];
+    if let Some(ch) = contract_hash {
+        lo[..32].copy_from_slice(ch);
+        hi[..32].copy_from_slice(ch);
+        lo[32..64].copy_from_slice(address);
+        hi[32..64].copy_from_slice(address);
+    } else {
+        // No contract filter — full table scan (still bounded by
+        // observer_address inside the helper that calls us).
+    }
+    (lo, hi)
+}
 
 pub mod schema;
 
@@ -100,6 +265,401 @@ impl Db {
 
     pub(crate) fn raw(&self) -> &redb::Database {
         &self.db
+    }
+
+    // ---- Query helpers (read-side, used by the RPC layer) ---------------
+
+    /// Read a single HTLC record by primary key. Returns `None` if
+    /// the indexer hasn't seen it (still in mempool, or pre-dates the
+    /// follower's scan window).
+    pub fn get_htlc(
+        &self,
+        lock_tx_id: &[u8; 32],
+        output_index: u32,
+    ) -> Result<Option<HtlcRecord>> {
+        let read = self.db.begin_read()?;
+        let t = read.open_table(HTLC_FULL)?;
+        let key = htlc_primary_key(lock_tx_id, output_index);
+        let bytes_opt: Option<Vec<u8>> = {
+            let opt = t.get(key.as_slice())?;
+            opt.map(|g| g.value().to_vec())
+        };
+        match bytes_opt {
+            Some(b) => Ok(Some(
+                bincode::deserialize(&b)
+                    .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up an HTLC by hashlock. Returns every record whose
+    /// `params.hash_lock` matches — typically one, but the protocol
+    /// permits collisions.
+    pub fn lookup_by_hashlock(&self, hash_lock: &[u8; 32]) -> Result<Vec<HtlcRecord>> {
+        let read = self.db.begin_read()?;
+        let by_hash = read.open_table(HTLC_BY_HASHLOCK)?;
+        let primary = read.open_table(HTLC_FULL)?;
+
+        let mut lo_buf = [0u8; 68];
+        lo_buf[..32].copy_from_slice(hash_lock);
+        let mut hi_buf = [0xFFu8; 68];
+        hi_buf[..32].copy_from_slice(hash_lock);
+
+        let mut primary_keys: Vec<[u8; 36]> = Vec::new();
+        {
+            let range = by_hash.range::<&[u8]>(lo_buf.as_slice()..=hi_buf.as_slice())?;
+            for entry in range {
+                let (k, _) = entry?;
+                let bytes = k.value();
+                if bytes.len() == 68 {
+                    let mut pk = [0u8; 36];
+                    pk.copy_from_slice(&bytes[32..]);
+                    primary_keys.push(pk);
+                }
+            }
+        }
+        let mut out: Vec<HtlcRecord> = Vec::with_capacity(primary_keys.len());
+        for pk in primary_keys {
+            let bytes_opt: Option<Vec<u8>> = {
+                let opt = primary.get(pk.as_slice())?;
+                opt.map(|g| g.value().to_vec())
+            };
+            if let Some(b) = bytes_opt {
+                out.push(
+                    bincode::deserialize(&b)
+                        .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// List HTLCs matching the filter, ordered by `(lock_block_height,
+    /// lock_tx_id, output_index)` ascending. The walletd-side index
+    /// does a primary-table scan; the indexer expects many more rows
+    /// so it picks the most selective secondary index when possible.
+    ///
+    /// `cursor`, if given, restricts to entries strictly greater than
+    /// that key; `limit` caps the returned page size.
+    pub fn list_htlcs(
+        &self,
+        filter: &HtlcFilter,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> Result<(Vec<HtlcRecord>, Option<Cursor>)> {
+        let read = self.db.begin_read()?;
+        let primary = read.open_table(HTLC_FULL)?;
+
+        // The expected page size is small (≤1000) and the full table
+        // is typically O(thousands) in the indexer's steady state.
+        // Scan the primary table directly and filter in-process; the
+        // secondary indexes are still useful for prefix-restricted
+        // scans (sender / receiver / hashlock) which we use below
+        // when a single-address filter is provided.
+        let mut materialized: Vec<HtlcRecord> = Vec::new();
+        if let Some(addr) = filter.address {
+            // Walk by_sender and by_receiver prefixes, deduping by
+            // primary key. Bounded scan: each secondary range yields
+            // at most one entry per primary key in the relevant slice.
+            let mut keys: std::collections::BTreeSet<[u8; 36]> =
+                std::collections::BTreeSet::new();
+
+            for table in [&HTLC_BY_SENDER, &HTLC_BY_RECEIVER] {
+                let t = read.open_table(*table)?;
+                let mut lo = [0u8; 76];
+                lo[..32].copy_from_slice(&addr);
+                let mut hi = [0xFFu8; 76];
+                hi[..32].copy_from_slice(&addr);
+                for entry in t.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+                    let (k, _) = entry?;
+                    if k.value().len() == 76 {
+                        let mut pk = [0u8; 36];
+                        pk[..32].copy_from_slice(&k.value()[40..72]);
+                        pk[32..].copy_from_slice(&k.value()[72..]);
+                        keys.insert(pk);
+                    }
+                }
+            }
+            for pk in keys {
+                let bytes_opt: Option<Vec<u8>> = {
+                    let opt = primary.get(pk.as_slice())?;
+                    opt.map(|g| g.value().to_vec())
+                };
+                if let Some(b) = bytes_opt {
+                    let rec: HtlcRecord = bincode::deserialize(&b)
+                        .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?;
+                    materialized.push(rec);
+                }
+            }
+        } else {
+            // No address filter — full primary scan.
+            let iter = primary.iter()?;
+            let serialized: Vec<Vec<u8>> = {
+                let mut v = Vec::new();
+                for entry in iter {
+                    let (_, value) = entry?;
+                    v.push(value.value().to_vec());
+                }
+                v
+            };
+            for blob in &serialized {
+                let rec: HtlcRecord = bincode::deserialize(blob)
+                    .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?;
+                materialized.push(rec);
+            }
+        }
+
+        // Apply remaining filters in-process.
+        materialized.retain(|r| filter_matches(r, filter));
+
+        // Sort by (lock_height, lock_tx_id, output_index).
+        materialized.sort_by(|a, b| {
+            let ah = a.lock_block_height.unwrap_or(u64::MAX);
+            let bh = b.lock_block_height.unwrap_or(u64::MAX);
+            ah.cmp(&bh)
+                .then_with(|| a.lock_tx_id.cmp(&b.lock_tx_id))
+                .then_with(|| a.output_index.cmp(&b.output_index))
+        });
+
+        // Cursor — drop everything <= cursor key.
+        if let Some(c) = cursor {
+            materialized.retain(|r| {
+                let h = r.lock_block_height.unwrap_or(u64::MAX);
+                (h, &r.lock_tx_id[..], r.output_index)
+                    > (c.lock_height, &c.lock_tx_id[..], c.output_index)
+            });
+        }
+
+        let next = if materialized.len() > limit {
+            let last = &materialized[limit - 1];
+            Some(Cursor {
+                lock_height: last.lock_block_height.unwrap_or(u64::MAX),
+                lock_tx_id: last.lock_tx_id,
+                output_index: last.output_index,
+            })
+        } else {
+            None
+        };
+        materialized.truncate(limit);
+        Ok((materialized, next))
+    }
+
+    /// Stream settlements for an address. Ordered by
+    /// `(block_height, tx_id)` ascending. Optionally restrict to a
+    /// single `contract_hash` (the typed-trust query).
+    pub fn list_settlements(
+        &self,
+        address: &[u8; 32],
+        contract_hash: Option<&[u8; 32]>,
+        since_height: Option<u64>,
+        limit: usize,
+        cursor: Option<SettlementCursor>,
+    ) -> Result<(Vec<crate::extract::SettlementRecord>, Option<SettlementCursor>)> {
+        let read = self.db.begin_read()?;
+        let by_contract = read.open_table(SETTLEMENT_BY_CONTRACT)?;
+
+        let (lo, hi) = settlement_range_for(address, contract_hash);
+        let mut rows: Vec<crate::extract::SettlementRecord> = Vec::new();
+        for entry in by_contract.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (_k, v) = entry?;
+            let s: crate::extract::SettlementRecord = bincode::deserialize(v.value())
+                .map_err(|e| Error::Storage(format!("decode settlement: {e}")))?;
+            // Filter by observer_address — the by_contract table is
+            // keyed `[contract; address; height; tx_id]` and we want
+            // settlements for the specific (address, contract) tuple.
+            if &s.observer_address != address {
+                continue;
+            }
+            if let Some(h) = since_height {
+                if s.block_height < h {
+                    continue;
+                }
+            }
+            rows.push(s);
+        }
+        rows.sort_by(|a, b| {
+            a.block_height
+                .cmp(&b.block_height)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
+        if let Some(c) = cursor {
+            rows.retain(|s| (s.block_height, &s.tx_id[..]) > (c.height, &c.tx_id[..]));
+        }
+        let next = if rows.len() > limit {
+            let last = &rows[limit - 1];
+            Some(SettlementCursor {
+                height: last.block_height,
+                tx_id: last.tx_id,
+            })
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok((rows, next))
+    }
+
+    /// Aggregate stats for an address × contract pair (or all
+    /// contracts if `contract_hash` is None — one row per distinct
+    /// contract_hash the address has touched).
+    pub fn contract_stats(
+        &self,
+        address: &[u8; 32],
+        contract_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<ContractStats>> {
+        // Walk settlements and aggregate. The indexer's expected
+        // steady state has settlements counted in thousands per
+        // address, so a single pass is fine.
+        let mut acc: std::collections::BTreeMap<[u8; 32], ContractStats> =
+            std::collections::BTreeMap::new();
+        // Use the by_address mirror so we don't have to scan every
+        // contract on chain.
+        let read = self.db.begin_read()?;
+        let by_addr = read.open_table(SETTLEMENT_BY_ADDRESS)?;
+        let by_contract = read.open_table(SETTLEMENT_BY_CONTRACT)?;
+
+        let mut lo = [0u8; 104];
+        lo[..32].copy_from_slice(address);
+        let mut hi = [0xFFu8; 104];
+        hi[..32].copy_from_slice(address);
+        if let Some(ch) = contract_hash {
+            lo[32..64].copy_from_slice(ch);
+            hi[32..64].copy_from_slice(ch);
+        }
+
+        for entry in by_addr.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (k, _) = entry?;
+            if k.value().len() != 104 {
+                continue;
+            }
+            // Reconstruct the contract-keyed key to read the value.
+            let mut contract = [0u8; 32];
+            contract.copy_from_slice(&k.value()[32..64]);
+            let mut contract_key = [0u8; 104];
+            contract_key[..32].copy_from_slice(&contract);
+            contract_key[32..64].copy_from_slice(address);
+            contract_key[64..72].copy_from_slice(&k.value()[64..72]);
+            contract_key[72..].copy_from_slice(&k.value()[72..]);
+
+            let bytes_opt: Option<Vec<u8>> = {
+                let opt = by_contract.get(contract_key.as_slice())?;
+                opt.map(|g| g.value().to_vec())
+            };
+            let Some(b) = bytes_opt else { continue };
+            let s: crate::extract::SettlementRecord = bincode::deserialize(&b)
+                .map_err(|e| Error::Storage(format!("decode settlement: {e}")))?;
+            let stats = acc.entry(contract).or_insert_with(|| ContractStats {
+                contract_hash: contract,
+                total: 0,
+                succeeded: 0,
+                refunded: 0,
+                sum_settle_blocks: 0,
+                last_settled_at_height: None,
+            });
+            stats.total += 1;
+            match s.outcome {
+                HtlcState::Claimed => stats.succeeded += 1,
+                HtlcState::Reclaimed => stats.refunded += 1,
+                _ => {}
+            }
+            stats.sum_settle_blocks += s.block_height;
+            stats.last_settled_at_height = Some(
+                stats
+                    .last_settled_at_height
+                    .map(|h| h.max(s.block_height))
+                    .unwrap_or(s.block_height),
+            );
+        }
+
+        Ok(acc.into_values().collect())
+    }
+
+    /// Walk every (address, height, tx_id, dir) row whose address
+    /// prefix matches the requested address. Ordered by
+    /// `(height, tx_id)` ascending.
+    pub fn list_address_history(
+        &self,
+        address: &[u8; 32],
+        since_height: Option<u64>,
+        limit: usize,
+        cursor: Option<HistoryCursor>,
+    ) -> Result<(Vec<AddressHistoryRow>, Option<HistoryCursor>)> {
+        let read = self.db.begin_read()?;
+        let t = read.open_table(TX_BY_ADDRESS)?;
+        let mut lo = [0u8; 73];
+        lo[..32].copy_from_slice(address);
+        let mut hi = [0xFFu8; 73];
+        hi[..32].copy_from_slice(address);
+
+        let mut rows: Vec<AddressHistoryRow> = Vec::new();
+        for entry in t.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (k, v) = entry?;
+            if k.value().len() != 73 {
+                continue;
+            }
+            let height = u64::from_be_bytes(k.value()[32..40].try_into().unwrap());
+            if let Some(min) = since_height {
+                if height < min {
+                    continue;
+                }
+            }
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&k.value()[40..72]);
+            let dir_byte = k.value()[72];
+            let val: ActivityValue = bincode::deserialize(v.value())
+                .map_err(|e| Error::Storage(format!("decode activity: {e}")))?;
+            rows.push(AddressHistoryRow {
+                block_height: height,
+                tx_id,
+                amount: val.amount,
+                is_input: dir_byte == DIR_INPUT_FROM,
+                is_coinbase: val.is_coinbase,
+            });
+        }
+        rows.sort_by(|a, b| {
+            a.block_height
+                .cmp(&b.block_height)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
+        if let Some(c) = cursor {
+            rows.retain(|r| (r.block_height, &r.tx_id[..]) > (c.height, &c.tx_id[..]));
+        }
+        let next = if rows.len() > limit {
+            let last = &rows[limit - 1];
+            Some(HistoryCursor {
+                height: last.block_height,
+                tx_id: last.tx_id,
+            })
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok((rows, next))
+    }
+
+    /// Local spent-by cache lookup. Used by the indexer's RPC layer
+    /// to answer `get_output_spent_by` without round-tripping to the
+    /// node every call; falls through to the node when the cache
+    /// misses.
+    pub fn cached_spent_by(
+        &self,
+        prev_tx_id: &[u8; 32],
+        output_index: u32,
+    ) -> Result<Option<SpentByCacheEntry>> {
+        let read = self.db.begin_read()?;
+        let t = read.open_table(SPENT_BY)?;
+        let key = spent_by_key(prev_tx_id, output_index);
+        let bytes_opt: Option<Vec<u8>> = {
+            let opt = t.get(key.as_slice())?;
+            opt.map(|g| g.value().to_vec())
+        };
+        match bytes_opt {
+            Some(b) => Ok(Some(
+                bincode::deserialize(&b)
+                    .map_err(|e| Error::Storage(format!("decode spent_by: {e}")))?,
+            )),
+            None => Ok(None),
+        }
     }
 
     // ---- Follower checkpoint ---------------------------------------------
