@@ -5,7 +5,7 @@
 //! The follower handles fetching; this module handles interpretation.
 
 use exfer::covenants::htlc::{try_parse_htlc, HtlcParams, HtlcRecord, HtlcRole, HtlcState};
-use exfer::script::serialize::{deserialize_program, merkle_hash};
+use exfer::script::serialize::{deserialize_program, structural_merkle_hash};
 use exfer::types::transaction::Transaction;
 use exfer::types::Hash256;
 use serde::{Deserialize, Serialize};
@@ -248,12 +248,24 @@ fn extract_claim_preimage(witness: &[u8]) -> Option<Vec<u8>> {
 // Contract hash + settlement construction
 // ---------------------------------------------------------------------------
 
-/// Compute the contract-hash (script Merkle root) for an HTLC output
-/// script. Two HTLCs built from the same template parameters produce
-/// the same contract_hash — this is the key the settlement-by-
-/// contract table groups on.
+/// Compute the contract-hash for an HTLC output script — the
+/// **structural** Merkle root of the deserialized program, with
+/// `Const(_)` value bytes blinded.
+///
+/// Two HTLCs built from the same template — `covenants::htlc::htlc(...)`
+/// — but with different sender/receiver/hashlock/timeout produce the
+/// same contract_hash. That's the key invariant the
+/// `settlement_by_contract` table groups on: "all locks of this kind",
+/// not "this specific instance".
+///
+/// This is **not** the on-chain commitment used to authorise spends —
+/// that's [`exfer::script::serialize::merkle_hash`] of the raw script
+/// bytes. The indexer uses the structural variant on purpose: as an
+/// application-layer template identifier, not a consensus commitment.
 pub fn contract_hash_of_script(script: &[u8]) -> Option<Hash256> {
-    deserialize_program(script).ok().map(|p| merkle_hash(&p))
+    deserialize_program(script)
+        .ok()
+        .map(|p| structural_merkle_hash(&p))
 }
 
 /// Build a [`SettlementRecord`] from an HTLC that just transitioned
@@ -262,16 +274,20 @@ pub fn contract_hash_of_script(script: &[u8]) -> Option<Hash256> {
 /// indexer (multi-tenant, no owned keys), we record one row per side
 /// — see [`settlements_for_settled_htlc`].
 pub fn settlements_for_settled_htlc(rec: &HtlcRecord, block_height: u64) -> Vec<SettlementRecord> {
-    // Compute contract_hash from the canonical template. The script
-    // bytes aren't on the record (would bloat it), so reconstruct via
-    // the public template constructor + serialize, then Merkle-hash.
+    // Compute contract_hash via the structural variant: identical
+    // template, different params → identical hash. We reconstruct the
+    // canonical program from the parsed params (the raw script bytes
+    // aren't on the record, by design), then take its structural
+    // Merkle root. Every HTLC settled on chain — whatever its specific
+    // sender/receiver/hashlock/timeout — collapses to the single
+    // "Standard HTLC v1" template hash here.
     let program = exfer::covenants::htlc::htlc(
         &rec.params.sender,
         &rec.params.receiver,
         &Hash256(rec.params.hash_lock),
         rec.params.timeout_height,
     );
-    let contract_hash = merkle_hash(&program).0;
+    let contract_hash = structural_merkle_hash(&program).0;
 
     let outcome = rec.state;
     let tx_id = settled_tx_id(rec).unwrap_or(rec.lock_tx_id);
@@ -374,23 +390,34 @@ mod tests {
     }
 
     #[test]
-    fn contract_hash_round_trips_template_params() {
+    fn contract_hash_is_template_keyed_not_instance_keyed() {
+        // The whole point of the structural variant: every HTLC built
+        // from `covenants::htlc::htlc(...)` collapses to one hash,
+        // regardless of which specific parameter values were baked in.
         use exfer::script::serialize::serialize_program;
-        let sender = [0x11u8; 32];
-        let receiver = [0x22u8; 32];
-        let hash_lock = Hash256([0x33u8; 32]);
-        let prog = exfer::covenants::htlc::htlc(&sender, &receiver, &hash_lock, 1000);
-        let script = serialize_program(&prog);
 
-        let a = contract_hash_of_script(&script).unwrap();
-        let b = contract_hash_of_script(&script).unwrap();
+        let sender_a = [0x11u8; 32];
+        let receiver_a = [0x22u8; 32];
+        let hash_lock_a = Hash256([0x33u8; 32]);
+        let prog_a = exfer::covenants::htlc::htlc(&sender_a, &receiver_a, &hash_lock_a, 1000);
+        let script_a = serialize_program(&prog_a);
+
+        let a = contract_hash_of_script(&script_a).unwrap();
+        let b = contract_hash_of_script(&script_a).unwrap();
         assert_eq!(a, b, "deterministic");
 
-        // Same template, different params → different hash.
-        let prog2 = exfer::covenants::htlc::htlc(&sender, &receiver, &hash_lock, 2000);
-        let script2 = serialize_program(&prog2);
-        let c = contract_hash_of_script(&script2).unwrap();
-        assert_ne!(a, c, "different timeout → different contract_hash");
+        // Different timeout — still the same template.
+        let prog_t = exfer::covenants::htlc::htlc(&sender_a, &receiver_a, &hash_lock_a, 2000);
+        let script_t = serialize_program(&prog_t);
+        let c = contract_hash_of_script(&script_t).unwrap();
+        assert_eq!(a, c, "different timeout must NOT change template hash");
+
+        // Different sender / receiver / hashlock — still the same template.
+        let prog_p =
+            exfer::covenants::htlc::htlc(&[0xAAu8; 32], &[0xBBu8; 32], &Hash256([0xCCu8; 32]), 42);
+        let script_p = serialize_program(&prog_p);
+        let d = contract_hash_of_script(&script_p).unwrap();
+        assert_eq!(a, d, "different params must NOT change template hash");
     }
 
     #[test]
