@@ -537,3 +537,178 @@ async fn bad_address_hex_is_rejected() {
     .unwrap_err();
     assert!(matches!(err, exfer_indexer::error::Error::BadAddressLen(_)));
 }
+
+// ---------------------------------------------------------------------------
+// get_attestation_edges
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_attestation_edges_groups_by_counterparty_and_contract() {
+    let ctx = make_ctx(0).await;
+    seed_settlements(&ctx).await;
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_attestation_edges",
+            json!({ "address": hex::encode([0x55; 32]) }),
+        ),
+    )
+    .await
+    .unwrap();
+    let edges = v["edges"].as_array().unwrap();
+    // seed_settlements seeds two rows with the same (counterparty,
+    // contract) — one Claimed, one Reclaimed — so we expect ONE edge
+    // with total=2, succeeded=1, refunded=1.
+    assert_eq!(edges.len(), 1);
+    let e = &edges[0];
+    assert_eq!(
+        e["counterparty"].as_str(),
+        Some(hex::encode([0x66; 32])).as_deref()
+    );
+    assert_eq!(
+        e["contract_hash"].as_str(),
+        Some(hex::encode([0xBB; 32])).as_deref()
+    );
+    assert_eq!(e["total"].as_u64(), Some(2));
+    assert_eq!(e["succeeded"].as_u64(), Some(1));
+    assert_eq!(e["refunded"].as_u64(), Some(1));
+    assert_eq!(e["last_seen_height"].as_u64(), Some(200));
+}
+
+// ---------------------------------------------------------------------------
+// detect_in_chain_swaps
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn detect_in_chain_swaps_groups_shared_hashlocks() {
+    let ctx = make_ctx(0).await;
+    // Two HTLCs sharing hashlock 0x33 (the default in fixed_record) —
+    // canonical atomic-swap fingerprint.
+    let r1 = fixed_record(
+        [0xA1; 32],
+        0,
+        100,
+        HtlcState::Locked,
+        [0x11; 32],
+        [0x22; 32],
+    );
+    let r2 = fixed_record(
+        [0xA2; 32],
+        0,
+        101,
+        HtlcState::Locked,
+        [0x33; 32],
+        [0x44; 32],
+    );
+    seed_htlc(&ctx, r1).await;
+    seed_htlc(&ctx, r2).await;
+    // A loner with a different hashlock — must NOT appear.
+    let mut r3 = fixed_record(
+        [0xA3; 32],
+        0,
+        102,
+        HtlcState::Locked,
+        [0x55; 32],
+        [0x66; 32],
+    );
+    r3.params.hash_lock = [0x77; 32];
+    seed_htlc(&ctx, r3).await;
+
+    let v = dispatch(&ctx.state, rpc("detect_in_chain_swaps", json!({})))
+        .await
+        .unwrap();
+    let swaps = v["swaps"].as_array().unwrap();
+    assert_eq!(swaps.len(), 1, "only the shared-hashlock group");
+    let g = &swaps[0];
+    assert_eq!(
+        g["hash_lock"].as_str(),
+        Some(hex::encode([0x33; 32])).as_deref()
+    );
+    assert_eq!(g["htlcs"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn detect_in_chain_swaps_filters_by_hash_lock() {
+    let ctx = make_ctx(0).await;
+    // Two HTLCs share 0x33; ask for 0x99 → empty.
+    let r1 = fixed_record(
+        [0xA1; 32],
+        0,
+        100,
+        HtlcState::Locked,
+        [0x11; 32],
+        [0x22; 32],
+    );
+    let r2 = fixed_record(
+        [0xA2; 32],
+        0,
+        101,
+        HtlcState::Locked,
+        [0x33; 32],
+        [0x44; 32],
+    );
+    seed_htlc(&ctx, r1).await;
+    seed_htlc(&ctx, r2).await;
+
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "detect_in_chain_swaps",
+            json!({ "hash_lock": hex::encode([0x99; 32]) }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["swaps"].as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// get_contract_template
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_contract_template_no_args_lists_all() {
+    let ctx = make_ctx(0).await;
+    let v = dispatch(&ctx.state, rpc("get_contract_template", json!({})))
+        .await
+        .unwrap();
+    let all = v["templates"].as_array().unwrap();
+    assert!(!all.is_empty());
+    assert!(all.iter().any(|t| t["name"] == "Standard HTLC v1"));
+}
+
+#[tokio::test]
+async fn get_contract_template_unknown_hash_returns_null() {
+    let ctx = make_ctx(0).await;
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_contract_template",
+            json!({ "contract_hash": hex::encode([0xAB; 32]) }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(v["template"].is_null());
+}
+
+#[tokio::test]
+async fn get_contract_template_known_hash_resolves() {
+    use exfer::covenants::htlc::htlc as build_htlc;
+    use exfer::script::serialize::structural_merkle_hash;
+    use exfer::types::Hash256;
+
+    let ctx = make_ctx(0).await;
+    let prog = build_htlc(&[0u8; 32], &[0u8; 32], &Hash256([0u8; 32]), 0);
+    let h = structural_merkle_hash(&prog).0;
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_contract_template",
+            json!({ "contract_hash": hex::encode(h) }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["template"]["name"].as_str(), Some("Standard HTLC v1"));
+}

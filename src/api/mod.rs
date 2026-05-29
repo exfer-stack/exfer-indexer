@@ -1,6 +1,6 @@
 //! JSON-RPC dispatch + handlers.
 //!
-//! The eight read-only methods that the indexer exposes for any
+//! The eleven read-only methods that the indexer exposes for any
 //! address on the chain. Each handler shape mirrors what `exfer-
 //! walletd` exposes for owned-key queries; consumers can route their
 //! questions to whichever service can answer (walletd for own, indexer
@@ -17,6 +17,9 @@
 //! `contract_stats` | read | aggregated stats per contract type
 //! `get_address_history` | read | address activity timeline
 //! `get_output_spent_by` | read | reverse-spend lookup (local cache + node fallback)
+//! `get_attestation_edges` | read | per-counterparty reputation edges for an address
+//! `detect_in_chain_swaps` | read | hashlock-collision groups (atomic-swap fingerprint)
+//! `get_contract_template` | read | template registry lookup by contract_hash
 
 use std::sync::Arc;
 
@@ -26,10 +29,12 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::db::{
-    AddressHistoryRow, ContractStats, Cursor, Db, HistoryCursor, HtlcFilter, SettlementCursor,
+    AddressHistoryRow, AttestationEdge, ContractStats, Cursor, Db, HistoryCursor, HtlcFilter,
+    SettlementCursor, SharedHashlockGroup,
 };
 use crate::error::{Error, Result};
 use crate::extract::SettlementRecord;
+use crate::templates;
 use crate::upstream::{NodeClient, SpentByResponse};
 
 #[derive(Clone)]
@@ -62,6 +67,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "get_address_history" => get_address_history(state, req.params).await,
 
         "get_output_spent_by" => get_output_spent_by(state, req.params).await,
+
+        "get_attestation_edges" => get_attestation_edges(state, req.params).await,
+        "detect_in_chain_swaps" => detect_in_chain_swaps(state, req.params).await,
+        "get_contract_template" => get_contract_template(req.params).await,
 
         unknown => Err(Error::UnknownMethod(unknown.to_string())),
     }
@@ -487,6 +496,137 @@ async fn get_output_spent_by(state: &ApiState, params: Value) -> Result<Value> {
         })),
         Err(e) => Err(e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// get_attestation_edges
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AttestationEdgesParams {
+    address: String,
+    #[serde(default)]
+    contract_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttestationEdgeJson {
+    counterparty: String,
+    contract_hash: String,
+    contract_name: Option<&'static str>,
+    total: u64,
+    succeeded: u64,
+    refunded: u64,
+    last_seen_height: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct AttestationEdgesResponse {
+    edges: Vec<AttestationEdgeJson>,
+}
+
+async fn get_attestation_edges(state: &ApiState, params: Value) -> Result<Value> {
+    let p: AttestationEdgesParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_attestation_edges: {e}")))?;
+    let address = decode_hex32(&p.address)?;
+    let contract_hash = match p.contract_hash.as_deref() {
+        Some(s) => Some(decode_hex32(s)?),
+        None => None,
+    };
+    let db = state.db.clone();
+    let rows =
+        tokio::task::spawn_blocking(move || db.attestation_edges(&address, contract_hash.as_ref()))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    let edges: Vec<AttestationEdgeJson> = rows
+        .iter()
+        .map(|e: &AttestationEdge| AttestationEdgeJson {
+            counterparty: hex::encode(e.counterparty),
+            contract_hash: hex::encode(e.contract_hash),
+            contract_name: templates::lookup(&e.contract_hash).map(|t| t.name),
+            total: e.total,
+            succeeded: e.succeeded,
+            refunded: e.refunded,
+            last_seen_height: e.last_seen_height,
+        })
+        .collect();
+    serde_json::to_value(AttestationEdgesResponse { edges })
+        .map_err(|e| Error::Internal(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// detect_in_chain_swaps
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DetectSwapsParams {
+    #[serde(default)]
+    hash_lock: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SwapGroupJson {
+    hash_lock: String,
+    htlcs: Vec<HtlcRecord>,
+}
+
+#[derive(Serialize)]
+struct DetectSwapsResponse {
+    swaps: Vec<SwapGroupJson>,
+}
+
+async fn detect_in_chain_swaps(state: &ApiState, params: Value) -> Result<Value> {
+    let p: DetectSwapsParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("detect_in_chain_swaps: {e}")))?;
+    let hash_lock = match p.hash_lock.as_deref() {
+        Some(s) => Some(decode_hex32(s)?),
+        None => None,
+    };
+    let limit = p
+        .limit
+        .unwrap_or(HTLC_LIST_DEFAULT_LIMIT)
+        .min(HTLC_LIST_MAX_LIMIT) as usize;
+    let db = state.db.clone();
+    let groups = tokio::task::spawn_blocking(move || {
+        db.find_shared_hashlock_groups(hash_lock.as_ref(), limit)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    let swaps: Vec<SwapGroupJson> = groups
+        .into_iter()
+        .map(|g: SharedHashlockGroup| SwapGroupJson {
+            hash_lock: hex::encode(g.hash_lock),
+            htlcs: g.htlcs,
+        })
+        .collect();
+    serde_json::to_value(DetectSwapsResponse { swaps }).map_err(|e| Error::Internal(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// get_contract_template
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GetContractTemplateParams {
+    #[serde(default)]
+    contract_hash: Option<String>,
+}
+
+async fn get_contract_template(params: Value) -> Result<Value> {
+    // No-arg form: enumerate every registered template.
+    let p: GetContractTemplateParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_contract_template: {e}")))?;
+    let Some(hash_str) = p.contract_hash else {
+        let all = templates::list_all();
+        return Ok(serde_json::json!({ "templates": all }));
+    };
+    let hash = decode_hex32(&hash_str)?;
+    let tpl = templates::lookup(&hash);
+    Ok(serde_json::json!({ "template": tpl }))
 }
 
 // ---------------------------------------------------------------------------

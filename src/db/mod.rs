@@ -136,6 +136,29 @@ pub struct ContractStats {
     pub last_settled_at_height: Option<u64>,
 }
 
+/// One row returned by [`Db::attestation_edges`] — a single
+/// (counterparty, contract_hash) pair the observed address has
+/// settled HTLCs with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationEdge {
+    pub counterparty: [u8; 32],
+    pub contract_hash: [u8; 32],
+    pub total: u64,
+    pub succeeded: u64,
+    pub refunded: u64,
+    pub last_seen_height: Option<u64>,
+}
+
+/// One group returned by [`Db::find_shared_hashlock_groups`] — a
+/// hashlock that more than one tracked HTLC has been locked under.
+/// On-chain, this is the canonical fingerprint of an atomic swap
+/// (HTLC pair sharing a preimage commitment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedHashlockGroup {
+    pub hash_lock: [u8; 32],
+    pub htlcs: Vec<HtlcRecord>,
+}
+
 /// One row returned by [`Db::list_address_history`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressHistoryRow {
@@ -560,6 +583,185 @@ impl Db {
         }
 
         Ok(acc.into_values().collect())
+    }
+
+    /// Per-counterparty reputation edges for an address. Walks
+    /// `settlement_by_address` and, for each settled HTLC the address
+    /// participated in, groups by `(counterparty, contract_hash)` —
+    /// one row per distinct trading partner per contract type.
+    ///
+    /// The shape is intentionally narrower than [`Db::contract_stats`]
+    /// (which aggregates across all counterparties): an attestation
+    /// graph wants to know "with WHOM has X succeeded?", which
+    /// `contract_stats` cannot answer.
+    pub fn attestation_edges(
+        &self,
+        address: &[u8; 32],
+        contract_hash: Option<&[u8; 32]>,
+    ) -> Result<Vec<AttestationEdge>> {
+        let mut acc: std::collections::BTreeMap<([u8; 32], [u8; 32]), AttestationEdge> =
+            std::collections::BTreeMap::new();
+
+        let read = self.db.begin_read()?;
+        let by_addr = read.open_table(SETTLEMENT_BY_ADDRESS)?;
+        let by_contract = read.open_table(SETTLEMENT_BY_CONTRACT)?;
+
+        // settlement_by_address keys: [address(32); contract(32); height(8); tx(32)]
+        let mut lo = [0u8; 104];
+        lo[..32].copy_from_slice(address);
+        let mut hi = [0xFFu8; 104];
+        hi[..32].copy_from_slice(address);
+        if let Some(ch) = contract_hash {
+            lo[32..64].copy_from_slice(ch);
+            hi[32..64].copy_from_slice(ch);
+        }
+
+        for entry in by_addr.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (k, _) = entry?;
+            if k.value().len() != 104 {
+                continue;
+            }
+            let mut contract = [0u8; 32];
+            contract.copy_from_slice(&k.value()[32..64]);
+            // The full payload lives in settlement_by_contract — we
+            // need the counterparty + outcome fields.
+            let mut contract_key = [0u8; 104];
+            contract_key[..32].copy_from_slice(&contract);
+            contract_key[32..64].copy_from_slice(address);
+            contract_key[64..72].copy_from_slice(&k.value()[64..72]);
+            contract_key[72..].copy_from_slice(&k.value()[72..]);
+
+            let bytes_opt: Option<Vec<u8>> = {
+                let opt = by_contract.get(contract_key.as_slice())?;
+                opt.map(|g| g.value().to_vec())
+            };
+            let Some(b) = bytes_opt else { continue };
+            let s: crate::extract::SettlementRecord = bincode::deserialize(&b)
+                .map_err(|e| Error::Storage(format!("decode settlement: {e}")))?;
+
+            let edge = acc
+                .entry((s.counterparty, contract))
+                .or_insert_with(|| AttestationEdge {
+                    counterparty: s.counterparty,
+                    contract_hash: contract,
+                    total: 0,
+                    succeeded: 0,
+                    refunded: 0,
+                    last_seen_height: None,
+                });
+            edge.total += 1;
+            match s.outcome {
+                HtlcState::Claimed => edge.succeeded += 1,
+                HtlcState::Reclaimed => edge.refunded += 1,
+                _ => {}
+            }
+            edge.last_seen_height = Some(
+                edge.last_seen_height
+                    .map(|h| h.max(s.block_height))
+                    .unwrap_or(s.block_height),
+            );
+        }
+
+        Ok(acc.into_values().collect())
+    }
+
+    /// Find groups of HTLCs that share a hashlock. On the public
+    /// chain, the canonical reason for two HTLCs to commit to the same
+    /// preimage is an atomic swap (one HTLC pays party A, the other
+    /// pays party B, both unlockable by the same secret).
+    ///
+    /// If `hash_lock` is supplied, returns at most one group for that
+    /// specific lock. Otherwise scans all hashlocks in the index and
+    /// returns every multi-HTLC group, ordered lexicographically by
+    /// hash_lock for stable cursors. `limit` caps the number of
+    /// groups returned, not the number of HTLCs inside each group.
+    pub fn find_shared_hashlock_groups(
+        &self,
+        hash_lock: Option<&[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<SharedHashlockGroup>> {
+        let read = self.db.begin_read()?;
+        let by_hash = read.open_table(HTLC_BY_HASHLOCK)?;
+        let primary = read.open_table(HTLC_FULL)?;
+
+        // by_hash key: [hash_lock(32); lock_tx_id(32); output_index(4)]
+        let (lo, hi): ([u8; 68], [u8; 68]) = match hash_lock {
+            Some(h) => {
+                let mut a = [0u8; 68];
+                let mut b = [0xFFu8; 68];
+                a[..32].copy_from_slice(h);
+                b[..32].copy_from_slice(h);
+                (a, b)
+            }
+            None => ([0u8; 68], [0xFFu8; 68]),
+        };
+
+        // Group primary-keys by hash_lock as we scan.
+        let mut current: Option<([u8; 32], Vec<[u8; 36]>)> = None;
+        let mut groups: Vec<([u8; 32], Vec<[u8; 36]>)> = Vec::new();
+
+        for entry in by_hash.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (k, _) = entry?;
+            let bytes = k.value();
+            if bytes.len() != 68 {
+                continue;
+            }
+            let mut hl = [0u8; 32];
+            hl.copy_from_slice(&bytes[..32]);
+            let mut pk = [0u8; 36];
+            pk.copy_from_slice(&bytes[32..]);
+
+            match &mut current {
+                Some((existing_hl, pks)) if *existing_hl == hl => {
+                    pks.push(pk);
+                }
+                _ => {
+                    // Flush the previous group before starting a new one.
+                    if let Some((existing_hl, pks)) = current.take() {
+                        if pks.len() > 1 {
+                            groups.push((existing_hl, pks));
+                            if groups.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    current = Some((hl, vec![pk]));
+                }
+            }
+        }
+        // Flush trailing group.
+        if let Some((existing_hl, pks)) = current.take() {
+            if pks.len() > 1 && groups.len() < limit {
+                groups.push((existing_hl, pks));
+            }
+        }
+
+        // Materialise each group's HtlcRecord rows.
+        let mut out: Vec<SharedHashlockGroup> = Vec::with_capacity(groups.len());
+        for (hl, pks) in groups {
+            let mut htlcs: Vec<HtlcRecord> = Vec::with_capacity(pks.len());
+            for pk in pks {
+                let bytes_opt: Option<Vec<u8>> = {
+                    let opt = primary.get(pk.as_slice())?;
+                    opt.map(|g| g.value().to_vec())
+                };
+                if let Some(b) = bytes_opt {
+                    htlcs.push(
+                        bincode::deserialize(&b)
+                            .map_err(|e| Error::Storage(format!("decode htlc: {e}")))?,
+                    );
+                }
+            }
+            // Skip groups that lost members between the index scan and
+            // the primary read — paranoid but cheap.
+            if htlcs.len() > 1 {
+                out.push(SharedHashlockGroup {
+                    hash_lock: hl,
+                    htlcs,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Walk every (address, height, tx_id, dir) row whose address

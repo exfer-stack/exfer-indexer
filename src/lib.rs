@@ -41,4 +41,5 @@ pub mod error;
 pub mod extract;
 pub mod follower;
 pub mod server;
+pub mod templates;
 pub mod upstream;
