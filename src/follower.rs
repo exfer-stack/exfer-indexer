@@ -24,6 +24,7 @@
 //! walk back to the common ancestor on mismatch, wipe everything
 //! above, re-walk forward.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +154,10 @@ impl Follower {
         let mut activity: Vec<AddressActivity> = Vec::new();
         let mut settlements: Vec<SettlementRecord> = Vec::new();
         let mut spent_by: Vec<SpentByCacheEntry> = Vec::new();
+        // Prev-tx cache for this block: an input's address + amount live on the
+        // output it spends, which is in an earlier (or same) tx. Several inputs
+        // can spend the same prev tx, so cache to avoid refetching it.
+        let mut prev_tx_cache: HashMap<[u8; 32], Transaction> = HashMap::new();
 
         // Fetch transactions. The node returns tx_ids only in
         // BlockSummary; per-tx fetch via get_transaction (which works
@@ -175,13 +180,44 @@ impl Follower {
             // lookup doesn't round-trip across two services.
             if !tx.is_coinbase() {
                 for (vin, input) in tx.inputs.iter().enumerate() {
+                    let prev_tx_id = *input.prev_tx_id.as_bytes();
                     spent_by.push(SpentByCacheEntry {
-                        prev_tx_id: *input.prev_tx_id.as_bytes(),
+                        prev_tx_id,
                         output_index: input.output_index,
                         spending_tx_id: extracted.tx_id,
                         input_index: vin as u32,
                         block_height: height,
                     });
+
+                    // Input-side address activity: the funds LEAVING an
+                    // address. get_address_history needs BOTH directions —
+                    // without this an outgoing transfer never appears for the
+                    // spending wallet, only the matching receive for the
+                    // recipient. The address + amount come from the output this
+                    // input spends, so we resolve the prev tx from the node.
+                    // Only Phase-1 P2PKH outputs (32-byte locking script) have a
+                    // canonical address; covenant/HTLC prevouts are skipped,
+                    // mirroring the output-side rule in extract_from_tx.
+                    if !prev_tx_cache.contains_key(&prev_tx_id) {
+                        if let Some(ptx) = self.fetch_tx(&prev_tx_id).await? {
+                            prev_tx_cache.insert(prev_tx_id, ptx);
+                        }
+                    }
+                    if let Some(ptx) = prev_tx_cache.get(&prev_tx_id) {
+                        if let Some(out) = ptx.outputs.get(input.output_index as usize) {
+                            if out.script.len() == 32 {
+                                let mut addr = [0u8; 32];
+                                addr.copy_from_slice(&out.script);
+                                activity.push(AddressActivity {
+                                    address: addr,
+                                    tx_id: extracted.tx_id,
+                                    amount: out.value,
+                                    is_input: true,
+                                    is_coinbase: false,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -224,6 +260,23 @@ impl Follower {
             spent_by: &spent_by,
         };
         self.db.apply_block_events(events)
+    }
+
+    /// Fetch + deserialize a confirmed tx by id, for resolving an input's
+    /// previous output. Returns `Ok(None)` if the node has no such tx (not
+    /// expected for a prevout on the canonical chain — we stay best-effort and
+    /// skip rather than wedge the block); transport errors propagate via `?` so
+    /// the block is retried on the next tick.
+    async fn fetch_tx(&self, tx_id: &[u8; 32]) -> Result<Option<Transaction>> {
+        let status = self.node.get_transaction(&hex::encode(tx_id)).await?;
+        if status.tx_hex.is_empty() {
+            return Ok(None);
+        }
+        let tx_bytes = hex::decode(&status.tx_hex)
+            .map_err(|e| Error::Internal(format!("decode prev tx_hex: {e}")))?;
+        let (tx, _) = Transaction::deserialize(&tx_bytes)
+            .map_err(|e| Error::Internal(format!("decode prev tx: {e:?}")))?;
+        Ok(Some(tx))
     }
 
     fn peek_htlc(&self, lock_tx_id: &[u8; 32], output_index: u32) -> Result<Option<Vec<u8>>> {
