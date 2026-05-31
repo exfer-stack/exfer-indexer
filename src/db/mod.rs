@@ -167,6 +167,10 @@ pub struct AddressHistoryRow {
     pub amount: u64,
     pub is_input: bool,
     pub is_coinbase: bool,
+    /// Addresses on the other side of this tx (senders for a received row,
+    /// recipients for a spent row), self excluded. See
+    /// [`crate::extract::AddressActivity::counterparties`].
+    pub counterparties: Vec<[u8; 32]>,
 }
 
 fn filter_matches(rec: &HtlcRecord, f: &HtlcFilter) -> bool {
@@ -804,6 +808,7 @@ impl Db {
                 amount: val.amount,
                 is_input: dir_byte == DIR_INPUT_FROM,
                 is_coinbase: val.is_coinbase,
+                counterparties: val.counterparties,
             });
         }
         rows.sort_by(|a, b| {
@@ -1272,6 +1277,7 @@ fn write_activity_within_txn(
     let val = bincode::serialize(&ActivityValue {
         amount: act.amount,
         is_coinbase: act.is_coinbase,
+        counterparties: act.counterparties.clone(),
     })
     .map_err(|e| Error::Storage(format!("encode activity: {e}")))?;
     t.insert(k.as_slice(), val.as_slice())?;
@@ -1282,6 +1288,8 @@ fn write_activity_within_txn(
 struct ActivityValue {
     amount: u64,
     is_coinbase: bool,
+    #[serde(default)]
+    counterparties: Vec<[u8; 32]>,
 }
 
 fn write_spent_by_within_txn(write: &redb::WriteTransaction, sb: &SpentByCacheEntry) -> Result<()> {

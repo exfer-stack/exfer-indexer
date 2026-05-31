@@ -68,6 +68,14 @@ pub struct AddressActivity {
     pub amount: u64,
     pub is_input: bool,
     pub is_coinbase: bool,
+    /// The addresses on the OTHER side of this tx, minus `address` itself:
+    /// for an output row (this address received) these are the senders (the
+    /// tx's input addresses); for an input row (this address spent) these are
+    /// the recipients (the tx's output addresses). Lets `get_address_history`
+    /// answer "from/to" natively, no per-tx re-decode. Filled by the follower
+    /// in `process_block` once both sides of the tx are known; pure
+    /// `extract_from_tx` leaves it empty (it can't see input addresses).
+    pub counterparties: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +123,7 @@ pub fn extract_from_tx(tx: &Transaction, height: u64, last_indexed_height: u64) 
                 amount: output.value,
                 is_input: false,
                 is_coinbase,
+                counterparties: Vec::new(),
             });
         }
 

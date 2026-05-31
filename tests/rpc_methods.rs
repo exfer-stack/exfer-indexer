@@ -418,6 +418,7 @@ async fn get_address_history_returns_activity_rows() {
             amount: 1_000,
             is_input: false,
             is_coinbase: false,
+            counterparties: vec![[0xCC; 32]],
         },
         AddressActivity {
             address: [0x77; 32],
@@ -425,6 +426,7 @@ async fn get_address_history_returns_activity_rows() {
             amount: 500,
             is_input: true,
             is_coinbase: false,
+            counterparties: vec![[0xDD; 32]],
         },
     ];
     ctx.db
@@ -456,8 +458,18 @@ async fn get_address_history_returns_activity_rows() {
     // ordered by tx_id within the same height
     assert_eq!(arr[0]["tx_id"].as_str().unwrap(), hex::encode([0xAA; 32]));
     assert_eq!(arr[0]["direction"].as_str(), Some("output"));
+    // received row → counterparty is the sender, returned as hex
+    assert_eq!(
+        arr[0]["counterparties"][0].as_str().unwrap(),
+        hex::encode([0xCC; 32])
+    );
     assert_eq!(arr[1]["tx_id"].as_str().unwrap(), hex::encode([0xBB; 32]));
     assert_eq!(arr[1]["direction"].as_str(), Some("input"));
+    // spent row → counterparty is the recipient
+    assert_eq!(
+        arr[1]["counterparties"][0].as_str().unwrap(),
+        hex::encode([0xDD; 32])
+    );
 }
 
 // ---------------------------------------------------------------------------

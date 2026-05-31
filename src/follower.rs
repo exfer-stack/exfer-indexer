@@ -172,12 +172,30 @@ impl Follower {
             let extracted = extract::extract_from_tx(&tx, height, 0);
             locks.extend(extracted.locks);
             spends.extend(extracted.spends.clone());
-            activity.extend(extracted.activity);
 
-            // Record spent-by entries for every non-coinbase input
-            // (cache for downstream consumers). The node also keeps a
-            // canonical spent-by, but caching here means an MCP-side
-            // lookup doesn't round-trip across two services.
+            // Collect this tx's activity rows locally so we can attach each
+            // row's counterparty set once BOTH sides are known. Output-side
+            // rows come from extract; input-side rows are resolved below.
+            let mut tx_activity: Vec<AddressActivity> = extracted.activity;
+            // Recipient addresses = the distinct output-side addresses.
+            let mut output_addrs: Vec<[u8; 32]> = Vec::new();
+            for a in &tx_activity {
+                if !output_addrs.contains(&a.address) {
+                    output_addrs.push(a.address);
+                }
+            }
+
+            // Sender addresses = the distinct addresses of the spent prevouts.
+            let mut input_addrs: Vec<[u8; 32]> = Vec::new();
+            // Record spent-by entries for every non-coinbase input (cache for
+            // downstream consumers) and, in the same pass, the input-side
+            // address activity — funds LEAVING an address. Without this an
+            // outgoing transfer never appears for the spending wallet, only the
+            // matching receive for the recipient. The address + amount come
+            // from the output this input spends, resolved via the prev tx
+            // (cached per block). Only Phase-1 P2PKH prevouts (32-byte script)
+            // have an address; covenant/HTLC prevouts are skipped, mirroring
+            // the output-side rule in extract_from_tx.
             if !tx.is_coinbase() {
                 for (vin, input) in tx.inputs.iter().enumerate() {
                     let prev_tx_id = *input.prev_tx_id.as_bytes();
@@ -189,15 +207,6 @@ impl Follower {
                         block_height: height,
                     });
 
-                    // Input-side address activity: the funds LEAVING an
-                    // address. get_address_history needs BOTH directions —
-                    // without this an outgoing transfer never appears for the
-                    // spending wallet, only the matching receive for the
-                    // recipient. The address + amount come from the output this
-                    // input spends, so we resolve the prev tx from the node.
-                    // Only Phase-1 P2PKH outputs (32-byte locking script) have a
-                    // canonical address; covenant/HTLC prevouts are skipped,
-                    // mirroring the output-side rule in extract_from_tx.
                     if !prev_tx_cache.contains_key(&prev_tx_id) {
                         if let Some(ptx) = self.fetch_tx(&prev_tx_id).await? {
                             prev_tx_cache.insert(prev_tx_id, ptx);
@@ -208,18 +217,39 @@ impl Follower {
                             if out.script.len() == 32 {
                                 let mut addr = [0u8; 32];
                                 addr.copy_from_slice(&out.script);
-                                activity.push(AddressActivity {
+                                if !input_addrs.contains(&addr) {
+                                    input_addrs.push(addr);
+                                }
+                                tx_activity.push(AddressActivity {
                                     address: addr,
                                     tx_id: extracted.tx_id,
                                     amount: out.value,
                                     is_input: true,
                                     is_coinbase: false,
+                                    counterparties: Vec::new(),
                                 });
                             }
                         }
                     }
                 }
             }
+
+            // Attach counterparties: a received (output) row's are the senders
+            // (tx inputs); a sent (input) row's are the recipients (tx
+            // outputs). Exclude the row's own address (self-change / self-send).
+            for row in &mut tx_activity {
+                let others = if row.is_input {
+                    &output_addrs
+                } else {
+                    &input_addrs
+                };
+                row.counterparties = others
+                    .iter()
+                    .filter(|a| **a != row.address)
+                    .copied()
+                    .collect();
+            }
+            activity.extend(tx_activity);
         }
 
         // Settlement records — built from the already-classified

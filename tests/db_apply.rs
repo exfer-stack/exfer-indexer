@@ -205,6 +205,7 @@ fn address_activity_round_trips() {
             amount: 1_000,
             is_input: false,
             is_coinbase: false,
+            counterparties: vec![[0x66; 32]],
         },
         AddressActivity {
             address: [0x66; 32],
@@ -212,6 +213,7 @@ fn address_activity_round_trips() {
             amount: 500,
             is_input: true,
             is_coinbase: false,
+            counterparties: vec![[0x55; 32]],
         },
     ];
     db.apply_block_events(BlockApplyEvents {
@@ -228,10 +230,25 @@ fn address_activity_round_trips() {
         spent_by: &[],
     })
     .unwrap();
-    // Smoke test — full scan / queries arrive with the RPC commit.
     let meta = db.load_meta().unwrap();
     assert_eq!(meta.last_indexed_height, 1);
     assert!(meta.full_scan_complete);
+
+    // The received (output) row reports its sender as counterparty…
+    let (recv, _) = db
+        .list_address_history(&[0x55; 32], None, 10, None)
+        .unwrap();
+    assert_eq!(recv.len(), 1);
+    assert!(!recv[0].is_input);
+    assert_eq!(recv[0].counterparties, vec![[0x66; 32]]);
+
+    // …and the spent (input) row reports its recipient.
+    let (sent, _) = db
+        .list_address_history(&[0x66; 32], None, 10, None)
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].is_input);
+    assert_eq!(sent[0].counterparties, vec![[0x55; 32]]);
 }
 
 #[test]

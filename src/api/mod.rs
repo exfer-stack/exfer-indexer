@@ -390,6 +390,11 @@ struct AddressHistoryRowJson {
     amount: u64,
     direction: &'static str,
     is_coinbase: bool,
+    /// Hex addresses on the other side of this tx: senders for a received
+    /// row (`direction: "output"`), recipients for a spent row
+    /// (`direction: "input"`). Self excluded. Empty when none were
+    /// resolvable (e.g. a coinbase, or covenant/HTLC prevouts).
+    counterparties: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -425,6 +430,7 @@ async fn get_address_history(state: &ApiState, params: Value) -> Result<Value> {
             amount: r.amount,
             direction: if r.is_input { "input" } else { "output" },
             is_coinbase: r.is_coinbase,
+            counterparties: r.counterparties.iter().map(hex::encode).collect(),
         })
         .collect();
     serde_json::to_value(AddressHistoryResponse {
