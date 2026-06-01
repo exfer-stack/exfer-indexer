@@ -19,25 +19,32 @@ for.
 
 ## Status
 
-`v0.1.0` — initial scaffold. The follower + RPC handlers land in
-subsequent commits per the workflow B plan:
+Working and deployed. The follower scans the full chain and keeps the
+redb store in sync with the node's tip (reorg-aware); the JSON-RPC
+surface answers live queries for any address. It runs as a read replica
+alongside the public Exfer nodes and powers the **Activity** timeline in
+[`exfer-walletd`](https://github.com/exfer-stack/exfer-walletd) /
+the wallet apps (`get_address_history`, with real tx ids and
+**from / to** counterparties), plus HTLC and attestation queries for
+ops, MCP servers, and explorers.
 
-- [x] **#12** Scaffold service (this commit): module structure,
-      config, error type, redb schema, dispatcher signature, server
-      boot path.
-- [ ] **#13** Block follower + extraction: full-chain scan, HTLC /
-      address / settlement extraction, populate every table.
-- [ ] **#14** RPC handlers: `list_settlements`, `contract_stats`,
-      `get_address_history`, `htlc_lookup_by_hashlock`,
-      `get_output_spent_by`, `htlc_status`, `htlc_list`,
-      `get_indexer_status`.
-- [ ] **walletd v1.9.1** indexer delegation flag so walletd can
-      transparently route non-owned queries here.
+**Query surface** (JSON-RPC `POST /`):
 
-The current binary boots, opens the redb file, spawns a no-op
-follower stub, and exits on Ctrl+C. Useful for verifying the
-scaffold compiles + the volume mount + auth wiring; not useful for
-answering real queries until the follower commit lands.
+- `get_address_history` — per-address on-chain timeline (in/out,
+  amounts, counterparties)
+- `get_indexer_status` — follower height / sync state
+- `htlc_list`, `htlc_status`, `htlc_lookup_by_hashlock` — HTLC
+  observability
+- `list_settlements`, `contract_stats`, `get_contract_template` —
+  contract / settlement views
+- `get_attestation_edges`, `detect_in_chain_swaps` — attestation graph
+  + swap detection
+- `get_output_spent_by` — spent-by lookups
+- `ping` — liveness
+
+walletd transparently delegates non-owned queries here when started with
+its indexer flag, so its MCP surface can answer about arbitrary
+addresses, not just owned keys.
 
 ## Design boundaries
 
