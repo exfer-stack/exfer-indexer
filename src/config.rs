@@ -32,7 +32,10 @@ pub struct Config {
     pub datadir: PathBuf,
 
     /// Optional bearer token. When set, every request must carry
-    /// `Authorization: Bearer <token>`. Unset = open API.
+    /// `Authorization: Bearer <token>`. Unset = open API. Note the indexer
+    /// serves only public chain data, so a token is a coarse abuse gate, not
+    /// confidentiality — a public read replica can safely run anonymous with
+    /// `--allow-public-bind`.
     #[arg(long, env = "EXFER_INDEXER_AUTH_TOKEN")]
     pub auth_token: Option<String>,
 
@@ -57,8 +60,10 @@ pub struct Config {
     #[arg(long, env = "EXFER_INDEXER_NO_FOLLOWER")]
     pub no_follower: bool,
 
-    /// Refuse to bind to non-loopback addresses without `--tls` and
-    /// without `--allow-public-bind` (mirrors walletd's safety rule).
+    /// Acknowledge a plaintext public bind. Without `--tls`, the indexer
+    /// refuses to listen on a non-loopback address unless this is set; with
+    /// it, a public endpoint is allowed even with no `--auth-token` (anonymous
+    /// open API over public chain data). Mirrors walletd's safety rule.
     #[arg(long, env = "EXFER_INDEXER_ALLOW_PUBLIC_BIND")]
     pub allow_public_bind: bool,
 

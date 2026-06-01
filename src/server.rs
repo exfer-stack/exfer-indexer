@@ -247,19 +247,27 @@ fn check_bind_safe(cfg: &Config) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    // Public bind.
-    if cfg.auth_token.is_none() && !cfg.tls {
+    // Public bind. The indexer serves only public chain data, so an
+    // anonymous public endpoint is a legitimate (if abuse-exposed) choice —
+    // an auth token here is a shared client secret, not real access control,
+    // and gives no confidentiality over data anyone can read off-chain. We
+    // therefore refuse only to bind publicly *implicitly*: TLS, or an explicit
+    // --allow-public-bind acknowledgement, is required. A token is optional.
+    if cfg.tls {
+        return Ok(());
+    }
+    if !cfg.allow_public_bind {
         anyhow::bail!(
-            "refusing to bind {} publicly without --tls or --auth-token; \
-             set EXFER_INDEXER_AUTH_TOKEN or use a TLS terminator + \
-             --allow-public-bind to acknowledge",
+            "refusing to bind {} publicly without --tls; pass --allow-public-bind \
+             to acknowledge a plaintext endpoint (--auth-token optional — the \
+             indexer serves only public chain data)",
             cfg.bind
         );
     }
-    if !cfg.allow_public_bind && !cfg.tls {
-        anyhow::bail!(
-            "refusing to bind {} on a public interface without --tls; \
-             pass --allow-public-bind if you have a TLS terminator in front",
+    if cfg.auth_token.is_none() {
+        tracing::warn!(
+            "binding {} publicly with NO auth token — serving public chain data \
+             anonymously; front it with a rate-limiter/firewall to deter abuse",
             cfg.bind
         );
     }

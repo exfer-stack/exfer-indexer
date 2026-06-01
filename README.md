@@ -93,6 +93,27 @@ exfer-indexer \
   --bind 127.0.0.1:9335
 ```
 
+### Public / anonymous deployment
+
+The indexer is **read-only** and serves only **public chain data** (the same
+address history any block explorer exposes). A bearer token here is therefore a
+shared client secret with no confidentiality value, so a public read replica
+can run **anonymously**:
+
+```bash
+exfer-indexer \
+  --node-rpc http://127.0.0.1:9334 \
+  --datadir /var/lib/exfer-indexer \
+  --bind 0.0.0.0:9335 \
+  --allow-public-bind          # acknowledge a plaintext public endpoint
+```
+
+`--allow-public-bind` is required to bind a non-loopback address without
+`--tls` (the indexer refuses to do so *implicitly*). `--auth-token` stays
+optional — set it only as a coarse abuse gate. When unset, the server ignores
+any `Authorization` header, so clients that still send a stale token keep
+working. Front a public endpoint with a rate-limiter/firewall to deter abuse.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
