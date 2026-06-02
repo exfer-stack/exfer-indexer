@@ -141,6 +141,10 @@ impl Follower {
         Ok(())
     }
 
+    // The prev-tx cache fill is a conditional, fallible, async insert
+    // (fetch only on a miss, skip on fetch failure) — the `entry` API the
+    // map_entry lint wants doesn't fit an awaited fallible fetch.
+    #[allow(clippy::map_entry)]
     async fn process_block(
         &self,
         height: u64,
