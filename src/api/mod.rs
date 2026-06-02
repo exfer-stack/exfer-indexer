@@ -71,6 +71,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "get_attestation_edges" => get_attestation_edges(state, req.params).await,
         "detect_in_chain_swaps" => detect_in_chain_swaps(state, req.params).await,
         "get_contract_template" => get_contract_template(req.params).await,
+        "resolve_name" => resolve_name(state, req.params).await,
 
         unknown => Err(Error::UnknownMethod(unknown.to_string())),
     }
@@ -636,6 +637,161 @@ async fn get_contract_template(params: Value) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// resolve_name — highest-cumulative-burn name registry (no consensus change)
+// ---------------------------------------------------------------------------
+//
+// A name maps to a derived 32-byte burn-script `name_script(name)` — an
+// unspendable target (no key hashes to it), so value sent there is burned.
+// Ownership is an open auction: the party with the **highest cumulative
+// burn** to the script owns the name and can be out-burned at any time
+// (no permanence). The owner declares where the name *points* by including
+// an extra output in their claim tx (any output whose recipient is neither
+// the burn-script nor the owner's own address); absent that, the name
+// points to the owner. Resolution reads the winner's latest claim tx for
+// the current pointer.
+
+/// Domain-separated derivation of the burn-script for a name. MUST stay
+/// byte-identical to walletd's `name_script`.
+pub fn name_script(name: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"EXFER-NAME-v1:");
+    h.update(name.trim().to_lowercase().as_bytes());
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&h.finalize());
+    s
+}
+
+#[derive(Deserialize)]
+struct ResolveNameParams {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ResolveNameResponse {
+    name: String,
+    /// The burn-script the name maps to (where claims are sent).
+    script: String,
+    /// The address the name resolves to (the winner's declared pointer,
+    /// or the winner itself). Null if unclaimed.
+    address: Option<String>,
+    /// The winning (highest cumulative burn) claimant address. Null if unclaimed.
+    owner: Option<String>,
+    /// Total value the winner has burned to this name.
+    total_burned: u64,
+    /// The winner's latest claim tx (the one that set the current pointer).
+    claim_tx_id: Option<String>,
+    claim_height: Option<u64>,
+}
+
+/// Per-bidder accumulation while scanning a name's claim history.
+#[derive(Default)]
+struct BidAgg {
+    total: u64,
+    first_height: u64,
+    latest_height: u64,
+    latest_tx: [u8; 32],
+}
+
+async fn resolve_name(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ResolveNameParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("resolve_name: {e}")))?;
+    let script = name_script(&p.name);
+
+    // Pull the full claim history for the burn-script (sorted asc by
+    // height, tx_id) and accumulate cumulative burn per bidder.
+    let db = state.db.clone();
+    let (rows, _next) = tokio::task::spawn_blocking(move || {
+        db.list_address_history(&script, None, HTLC_LIST_MAX_LIMIT as usize, None)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    let mut bids: std::collections::HashMap<[u8; 32], BidAgg> = std::collections::HashMap::new();
+    for r in &rows {
+        if r.is_input || r.is_coinbase || r.counterparties.is_empty() {
+            continue; // only inbound burns with a known sender count
+        }
+        let bidder = r.counterparties[0];
+        let agg = bids.entry(bidder).or_insert_with(|| BidAgg {
+            first_height: r.block_height,
+            ..Default::default()
+        });
+        agg.total = agg.total.saturating_add(r.amount);
+        agg.first_height = agg.first_height.min(r.block_height);
+        if r.block_height >= agg.latest_height {
+            agg.latest_height = r.block_height;
+            agg.latest_tx = r.tx_id;
+        }
+    }
+
+    // Winner = highest cumulative burn; ties broken by earliest first claim,
+    // then lowest address (fully deterministic).
+    let winner = bids.iter().max_by(|(a_addr, a), (b_addr, b)| {
+        a.total
+            .cmp(&b.total)
+            .then_with(|| b.first_height.cmp(&a.first_height)) // earlier first claim wins
+            .then_with(|| b_addr.cmp(a_addr)) // lower address wins
+    });
+
+    let resp = match winner {
+        None => ResolveNameResponse {
+            name: p.name,
+            script: hex::encode(script),
+            address: None,
+            owner: None,
+            total_burned: 0,
+            claim_tx_id: None,
+            claim_height: None,
+        },
+        Some((owner_addr, agg)) => {
+            // The pointer is declared in the winner's latest claim tx: the
+            // first output whose recipient is neither the burn-script nor
+            // the owner. Fall back to the owner on any fetch/parse failure.
+            let pointer = self_resolve_pointer(state, &agg.latest_tx, &script, owner_addr)
+                .await
+                .unwrap_or(*owner_addr);
+            ResolveNameResponse {
+                name: p.name,
+                script: hex::encode(script),
+                address: Some(hex::encode(pointer)),
+                owner: Some(hex::encode(owner_addr)),
+                total_burned: agg.total,
+                claim_tx_id: Some(hex::encode(agg.latest_tx)),
+                claim_height: Some(agg.latest_height),
+            }
+        }
+    };
+    serde_json::to_value(resp).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Read the pointer address declared in a claim tx: the first 32-byte
+/// output script that is neither the burn-script nor the owner. Returns
+/// `None` (caller defaults to the owner) if the tx can't be fetched/parsed
+/// or carries no such output.
+async fn self_resolve_pointer(
+    state: &ApiState,
+    tx_id: &[u8; 32],
+    script: &[u8; 32],
+    owner: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let tx_status = state.node.get_transaction(&hex::encode(tx_id)).await.ok()?;
+    let bytes = hex::decode(&tx_status.tx_hex).ok()?;
+    let (tx, _) = exfer::types::transaction::Transaction::deserialize(&bytes).ok()?;
+    for out in &tx.outputs {
+        if out.script.len() == 32
+            && out.script.as_slice() != script.as_slice()
+            && out.script.as_slice() != owner.as_slice()
+        {
+            let mut t = [0u8; 32];
+            t.copy_from_slice(&out.script);
+            return Some(t);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -647,4 +803,21 @@ fn decode_hex32(s: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&b);
     Ok(out)
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::name_script;
+
+    // This vector MUST match walletd's `name_script` test. If either side
+    // changes the derivation, both tests fail and the registry would split.
+    const ALICE: &str = "dbbce120c1d1bc12cba5ed500e1fe9c4b67ae92ec4349d3d847f01d74e711dcd";
+
+    #[test]
+    fn name_script_is_case_and_whitespace_insensitive() {
+        let want = hex::decode(ALICE).unwrap();
+        for n in ["alice", "Alice", "  ALICE  "] {
+            assert_eq!(name_script(n).to_vec(), want, "mismatch for {n:?}");
+        }
+    }
 }
