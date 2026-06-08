@@ -17,6 +17,8 @@
 //! `contract_stats` | read | aggregated stats per contract type
 //! `get_address_history` | read | address activity timeline
 //! `get_output_spent_by` | read | reverse-spend lookup (local cache + node fallback)
+//! `get_output_datum` | read | EXFER-QUOTE settlement datum for an outpoint (quote_id / unhonorable)
+//! `find_settlements_by_quote_id` | read | EXFER-QUOTE reverse index: outpoints carrying a quote_id
 //! `get_attestation_edges` | read | per-counterparty reputation edges for an address
 //! `detect_in_chain_swaps` | read | hashlock-collision groups (atomic-swap fingerprint)
 //! `get_contract_template` | read | template registry lookup by contract_hash
@@ -29,8 +31,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::db::{
-    AddressHistoryRow, AttestationEdge, ContractStats, Cursor, Db, HistoryCursor, HtlcFilter,
-    SettlementCursor, SharedHashlockGroup,
+    AddressHistoryRow, AttestationEdge, ContractStats, Cursor, DatumOutpoint, Db, HistoryCursor,
+    HtlcFilter, SettlementCursor, SharedHashlockGroup,
 };
 use crate::error::{Error, Result};
 use crate::extract::SettlementRecord;
@@ -67,6 +69,9 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "get_address_history" => get_address_history(state, req.params).await,
 
         "get_output_spent_by" => get_output_spent_by(state, req.params).await,
+
+        "get_output_datum" => get_output_datum(state, req.params).await,
+        "find_settlements_by_quote_id" => find_settlements_by_quote_id(state, req.params).await,
 
         "get_attestation_edges" => get_attestation_edges(state, req.params).await,
         "detect_in_chain_swaps" => detect_in_chain_swaps(state, req.params).await,
@@ -505,6 +510,90 @@ async fn get_output_spent_by(state: &ApiState, params: Value) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// get_output_datum  (EXFER-QUOTE settlement-datum read, §6)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GetOutputDatumParams {
+    tx_id: String,
+    output_index: u32,
+}
+
+/// Return the indexed settlement datum for an outpoint:
+/// `{ quote_id: <hex|null>, unhonorable: <bool> }`.
+///
+/// - `quote_id` is present iff a strict 16-byte inline datum was
+///   indexed (`[HOLE-F1]`).
+/// - `unhonorable` is true iff the output committed via `datum_hash`
+///   with no inline datum (`[HOLE-M2]`) — never a quote match.
+///
+/// An outpoint with no indexed datum signal yields
+/// `{ quote_id: null, unhonorable: false }`.
+async fn get_output_datum(state: &ApiState, params: Value) -> Result<Value> {
+    let p: GetOutputDatumParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_output_datum: {e}")))?;
+    let tx_id = decode_hex32(&p.tx_id)?;
+    let db = state.db.clone();
+    let oi = p.output_index;
+    let rec = tokio::task::spawn_blocking(move || db.get_output_datum(&tx_id, oi))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    match rec {
+        Some(r) => Ok(serde_json::json!({
+            "quote_id": r.quote_id.map(hex::encode),
+            "unhonorable": r.unhonorable,
+        })),
+        None => Ok(serde_json::json!({
+            "quote_id": Value::Null,
+            "unhonorable": false,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// find_settlements_by_quote_id  (EXFER-QUOTE reverse index, §6)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FindSettlementsParams {
+    quote_id: String,
+}
+
+#[derive(Serialize)]
+struct SettlementOutpointJson {
+    tx_id: String,
+    output_index: u32,
+}
+
+#[derive(Serialize)]
+struct FindSettlementsResponse {
+    settlements: Vec<SettlementOutpointJson>,
+}
+
+/// Return every outpoint carrying this exact 16-byte `quote_id`
+/// (full-equality, indexed strict-decoded datums only). Empty if none.
+/// Multiple outpoints CAN be returned — the swap-side gate enforces
+/// 1:1; the indexer reports the facts.
+async fn find_settlements_by_quote_id(state: &ApiState, params: Value) -> Result<Value> {
+    let p: FindSettlementsParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("find_settlements_by_quote_id: {e}")))?;
+    let quote_id = decode_hex16(&p.quote_id)?;
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.find_settlements_by_quote_id(&quote_id))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    let settlements: Vec<SettlementOutpointJson> = rows
+        .iter()
+        .map(|o: &DatumOutpoint| SettlementOutpointJson {
+            tx_id: hex::encode(o.tx_id),
+            output_index: o.output_index,
+        })
+        .collect();
+    serde_json::to_value(FindSettlementsResponse { settlements })
+        .map_err(|e| Error::Internal(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // get_attestation_edges
 // ---------------------------------------------------------------------------
 
@@ -645,6 +734,22 @@ fn decode_hex32(s: &str) -> Result<[u8; 32]> {
         return Err(Error::BadAddressLen(b.len()));
     }
     let mut out = [0u8; 32];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+/// Decode a 16-byte (32 hex char) EXFER-QUOTE `quote_id`. Strict on
+/// length — a quote_id is exactly 16 bytes (`WAVE3_HONOR_DESIGN.md`
+/// §4.0).
+fn decode_hex16(s: &str) -> Result<[u8; 16]> {
+    let b = hex::decode(s).map_err(|e| Error::BadHex(e.to_string()))?;
+    if b.len() != 16 {
+        return Err(Error::BadParams(format!(
+            "quote_id: expected 16 bytes (32 hex chars), got {} bytes",
+            b.len()
+        )));
+    }
+    let mut out = [0u8; 16];
     out.copy_from_slice(&b);
     Ok(out)
 }

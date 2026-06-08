@@ -121,6 +121,25 @@ optional — set it only as a coarse abuse gate. When unset, the server ignores
 any `Authorization` header, so clients that still send a stale token keep
 working. Front a public endpoint with a rate-limiter/firewall to deter abuse.
 
+## Upgrades & reindex
+
+The follower checkpoint carries an on-disk `schema_version`. When a release adds
+a table that must be populated over **already-scanned** blocks — e.g. the
+EXFER-QUOTE settlement-datum tables (`output_datum` / `datum_by_quoteid`) added
+in schema version 1 — the new binary detects a below-current `schema_version` on
+startup and **automatically resets the follower checkpoint to genesis**, so the
+next scan re-walks the whole chain and backfills the new tables. The per-block
+apply is idempotent, so re-walking already-indexed blocks does not duplicate
+rows; it only rebuilds the store and fills the new indexes.
+
+Operator impact: after such an upgrade the indexer reports a large sync lag
+(`get_indexer_status`) until the from-genesis re-walk catches up to tip. Datum
+queries (`get_output_datum`, `find_settlements_by_quote_id`) only return complete
+results once the re-walk has passed the heights of interest. No manual flag or
+datadir wipe is needed; the migration runs once and stamps the new version so
+subsequent restarts do not reindex again. (To force a manual reindex, delete the
+`index.redb` file in `--datadir` and restart.)
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

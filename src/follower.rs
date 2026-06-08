@@ -35,7 +35,8 @@ use crate::config::Config;
 use crate::db::{BlockApplyEvents, Db, SpentByCacheEntry};
 use crate::error::{Error, Result};
 use crate::extract::{
-    self, AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, SettlementRecord,
+    self, AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, ExtractedOutputDatum,
+    SettlementRecord,
 };
 use crate::upstream::{BlockSummary, NodeClient};
 
@@ -158,6 +159,7 @@ impl Follower {
         let mut activity: Vec<AddressActivity> = Vec::new();
         let mut settlements: Vec<SettlementRecord> = Vec::new();
         let mut spent_by: Vec<SpentByCacheEntry> = Vec::new();
+        let mut output_datums: Vec<ExtractedOutputDatum> = Vec::new();
         // Prev-tx cache for this block: an input's address + amount live on the
         // output it spends, which is in an earlier (or same) tx. Several inputs
         // can spend the same prev tx, so cache to avoid refetching it.
@@ -176,6 +178,7 @@ impl Follower {
             let extracted = extract::extract_from_tx(&tx, height, 0);
             locks.extend(extracted.locks);
             spends.extend(extracted.spends.clone());
+            output_datums.extend(extracted.output_datums);
 
             // Collect this tx's activity rows locally so we can attach each
             // row's counterparty set once BOTH sides are known. Output-side
@@ -292,6 +295,7 @@ impl Follower {
             settlements: &settlements,
             activity: &activity,
             spent_by: &spent_by,
+            output_datums: &output_datums,
         };
         self.db.apply_block_events(events)
     }

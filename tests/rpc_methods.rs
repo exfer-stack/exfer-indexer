@@ -11,7 +11,7 @@ use std::time::Duration;
 use exfer::covenants::htlc::{HtlcParams, HtlcRecord, HtlcRole, HtlcState};
 use exfer_indexer::api::{dispatch, ApiState, RpcRequest};
 use exfer_indexer::db::{BlockApplyEvents, Db, FollowerMeta};
-use exfer_indexer::extract::{ExtractedHtlcLock, SettlementRecord};
+use exfer_indexer::extract::{ExtractedHtlcLock, ExtractedOutputDatum, SettlementRecord};
 use exfer_indexer::upstream::NodeClient;
 use serde_json::{json, Value};
 use tokio::sync::watch;
@@ -112,6 +112,7 @@ async fn seed_htlc(ctx: &Ctx, rec: HtlcRecord) {
             settlements: &[],
             activity: &[],
             spent_by: &[],
+            output_datums: &[],
         })
         .unwrap();
 }
@@ -135,6 +136,7 @@ async fn get_indexer_status_reports_tip_and_lag() {
         last_indexed_block_id: [0xAB; 32],
         full_scan_complete: false,
         started_at: 1_700_000_000,
+        schema_version: exfer_indexer::db::SCHEMA_VERSION,
     };
     ctx.db.save_meta(&meta).unwrap();
 
@@ -336,6 +338,7 @@ async fn seed_settlements(ctx: &Ctx) {
             settlements: &settlements,
             activity: &[],
             spent_by: &[],
+            output_datums: &[],
         })
         .unwrap();
 }
@@ -442,6 +445,7 @@ async fn get_address_history_returns_activity_rows() {
             settlements: &[],
             activity: &activity,
             spent_by: &[],
+            output_datums: &[],
         })
         .unwrap();
     let v = dispatch(
@@ -500,6 +504,7 @@ async fn get_output_spent_by_hits_local_cache_first() {
             settlements: &[],
             activity: &[],
             spent_by: std::slice::from_ref(&sb),
+            output_datums: &[],
         })
         .unwrap();
 
@@ -519,6 +524,178 @@ async fn get_output_spent_by_hits_local_cache_first() {
     );
     assert_eq!(v["block_height"].as_u64(), Some(7));
     assert_eq!(v["source"].as_str(), Some("indexer-cache"));
+}
+
+// ---------------------------------------------------------------------------
+// get_output_datum / find_settlements_by_quote_id  (Wave 3 Stage 1)
+// ---------------------------------------------------------------------------
+
+async fn seed_output_datums(ctx: &Ctx, height: u64, datums: &[ExtractedOutputDatum]) {
+    ctx.db
+        .apply_block_events(BlockApplyEvents {
+            height,
+            block_id: [(height as u8); 32],
+            tx_count: 1,
+            timestamp: 1_700_000_000,
+            full_scan_complete: true,
+            started_at: 1_700_000_000,
+            locks: &[],
+            spends: &[],
+            settlements: &[],
+            activity: &[],
+            spent_by: &[],
+            output_datums: datums,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn get_output_datum_returns_quote_id_for_honorable_output() {
+    let ctx = make_ctx(0).await;
+    let quote_id = [0x7A; 16];
+    let tx_id = [0xAB; 32];
+    seed_output_datums(
+        &ctx,
+        50,
+        &[ExtractedOutputDatum {
+            tx_id,
+            output_index: 1,
+            quote_id: Some(quote_id),
+            unhonorable: false,
+        }],
+    )
+    .await;
+
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_output_datum",
+            json!({ "tx_id": hex::encode(tx_id), "output_index": 1 }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["quote_id"].as_str(),
+        Some(hex::encode(quote_id)).as_deref()
+    );
+    assert_eq!(v["unhonorable"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn get_output_datum_flags_datum_hash_only_as_unhonorable() {
+    let ctx = make_ctx(0).await;
+    let tx_id = [0xEF; 32];
+    seed_output_datums(
+        &ctx,
+        50,
+        &[ExtractedOutputDatum {
+            tx_id,
+            output_index: 0,
+            quote_id: None,
+            unhonorable: true,
+        }],
+    )
+    .await;
+
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_output_datum",
+            json!({ "tx_id": hex::encode(tx_id), "output_index": 0 }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(v["quote_id"].is_null());
+    assert_eq!(v["unhonorable"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn get_output_datum_unknown_outpoint_is_null_not_unhonorable() {
+    let ctx = make_ctx(0).await;
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "get_output_datum",
+            json!({ "tx_id": hex::encode([0x00; 32]), "output_index": 9 }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(v["quote_id"].is_null());
+    assert_eq!(v["unhonorable"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn find_settlements_by_quote_id_returns_all_outpoints() {
+    let ctx = make_ctx(0).await;
+    let quote_id = [0x11; 16];
+    seed_output_datums(
+        &ctx,
+        80,
+        &[
+            ExtractedOutputDatum {
+                tx_id: [0x01; 32],
+                output_index: 0,
+                quote_id: Some(quote_id),
+                unhonorable: false,
+            },
+            ExtractedOutputDatum {
+                tx_id: [0x02; 32],
+                output_index: 5,
+                quote_id: Some(quote_id),
+                unhonorable: false,
+            },
+        ],
+    )
+    .await;
+
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "find_settlements_by_quote_id",
+            json!({ "quote_id": hex::encode(quote_id) }),
+        ),
+    )
+    .await
+    .unwrap();
+    let arr = v["settlements"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+}
+
+#[tokio::test]
+async fn find_settlements_by_quote_id_empty_for_unknown() {
+    let ctx = make_ctx(0).await;
+    let v = dispatch(
+        &ctx.state,
+        rpc(
+            "find_settlements_by_quote_id",
+            json!({ "quote_id": hex::encode([0xCD; 16]) }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["settlements"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn find_settlements_by_quote_id_rejects_wrong_length() {
+    let ctx = make_ctx(0).await;
+    // A 32-byte (full-size) input is NOT a valid 16-byte quote_id.
+    let err = dispatch(
+        &ctx.state,
+        rpc(
+            "find_settlements_by_quote_id",
+            json!({ "quote_id": hex::encode([0xCD; 32]) }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, exfer_indexer::error::Error::BadParams(_)),
+        "got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
