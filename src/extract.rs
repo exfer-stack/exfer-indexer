@@ -24,6 +24,52 @@ pub const VALUE_TAG_UNIT: u8 = 0x00;
 /// Wire-format byte for `Value::Bytes(_)`.
 pub const VALUE_TAG_BYTES: u8 = 0x05;
 
+/// Length in bytes of an EXFER-QUOTE `quote_id`. A honorable
+/// settlement datum is EXACTLY this many bytes and equals the
+/// `quote_id` — nothing else (`WAVE3_HONOR_DESIGN.md` §4.0, decision
+/// D7: bare-16-byte form).
+pub const QUOTE_ID_BYTES: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Strict settlement-datum decode (`[HOLE-F1]` / `[HOLE-M2]`)
+// ---------------------------------------------------------------------------
+
+/// Strict EXFER-QUOTE settlement-datum decode (`WAVE3_HONOR_DESIGN.md`
+/// §4.0). Returns `Some(quote_id)` **iff** `datum` is EXACTLY 16 bytes
+/// — those 16 bytes ARE the `quote_id`. Any other length (15, 17, 32,
+/// 0, …) returns `None`: no trailing bytes, no multi-id, no
+/// length-prefix games. This is the only function that decides whether
+/// an inline datum binds a quote; matching downstream is FULL-EQUALITY
+/// on the returned 16 bytes, never substring/contains.
+pub fn strict_decode_quote_id(datum: &[u8]) -> Option<[u8; QUOTE_ID_BYTES]> {
+    if datum.len() != QUOTE_ID_BYTES {
+        return None;
+    }
+    let mut out = [0u8; QUOTE_ID_BYTES];
+    out.copy_from_slice(datum);
+    Some(out)
+}
+
+/// One row for the settlement-datum forward index (`OUTPUT_DATUM`).
+/// Emitted by [`extract_from_tx`] for every output carrying an
+/// honor-relevant datum signal. Outputs with neither an inline datum
+/// nor a `datum_hash` produce no row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedOutputDatum {
+    pub tx_id: [u8; 32],
+    pub output_index: u32,
+    /// `Some(quote_id)` iff the inline datum strict-decoded to exactly
+    /// 16 bytes (`[HOLE-F1]`). `None` means the output is recorded only
+    /// because it is `datum_hash`-only and therefore unhonorable.
+    pub quote_id: Option<[u8; QUOTE_ID_BYTES]>,
+    /// `true` iff the output commits a datum via `datum_hash` with NO
+    /// inline datum the indexer can read — the `[HOLE-M2]` escape
+    /// hatch. Recorded explicitly (not absent) so the query surface can
+    /// flag it; the acceptor MUST decline such candidates and MUST
+    /// NEVER fall back to address+amount matching.
+    pub unhonorable: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Extracted event types
 // ---------------------------------------------------------------------------
@@ -106,11 +152,49 @@ pub fn extract_from_tx(tx: &Transaction, height: u64, last_indexed_height: u64) 
     let mut locks: Vec<ExtractedHtlcLock> = Vec::new();
     let mut spends: Vec<ExtractedHtlcSpend> = Vec::new();
     let mut activity: Vec<AddressActivity> = Vec::new();
+    let mut output_datums: Vec<ExtractedOutputDatum> = Vec::new();
 
     let is_coinbase = tx.is_coinbase();
 
     // ---- Outputs ----
     for (vout, output) in tx.outputs.iter().enumerate() {
+        // EXFER-QUOTE settlement-datum read (`WAVE3_HONOR_DESIGN.md`
+        // §4.0 / §6). `TxOutput` carries EITHER an inline `datum` OR a
+        // `datum_hash` (never both, by consensus). Inspect both:
+        //  - inline datum that strict-decodes to exactly one 16-byte
+        //    quote_id → index it (honorable).
+        //  - `datum_hash`-only (no inline datum) → record the outpoint
+        //    as UNHONORABLE (`[HOLE-M2]`), not absent. The indexer
+        //    cannot read it, so it must never become a quote match and
+        //    the acceptor must never fall back to address+amount.
+        //  - malformed / multi-id / oversized inline datum → NOT
+        //    indexed (`[HOLE-F1]`); it never produces a candidate.
+        match (&output.datum, &output.datum_hash) {
+            (Some(datum), _) => {
+                if let Some(quote_id) = strict_decode_quote_id(datum) {
+                    output_datums.push(ExtractedOutputDatum {
+                        tx_id,
+                        output_index: vout as u32,
+                        quote_id: Some(quote_id),
+                        unhonorable: false,
+                    });
+                }
+                // else: oversized / wrong-length inline datum — drop it
+                // silently. It is neither a quote match nor unhonorable
+                // in the datum_hash sense; the acceptor would decline it
+                // because no candidate is ever produced.
+            }
+            (None, Some(_hash)) => {
+                output_datums.push(ExtractedOutputDatum {
+                    tx_id,
+                    output_index: vout as u32,
+                    quote_id: None,
+                    unhonorable: true,
+                });
+            }
+            (None, None) => {}
+        }
+
         // Address activity: Phase-1 P2PKH outputs use a 32-byte
         // pubkey-hash script. Anything else (covenants, HTLC scripts)
         // is not an "address" — record only Phase-1 here.
@@ -198,6 +282,7 @@ pub fn extract_from_tx(tx: &Transaction, height: u64, last_indexed_height: u64) 
         locks,
         spends,
         activity,
+        output_datums,
     }
 }
 
@@ -207,6 +292,11 @@ pub struct ExtractedTx {
     pub locks: Vec<ExtractedHtlcLock>,
     pub spends: Vec<ExtractedHtlcSpend>,
     pub activity: Vec<AddressActivity>,
+    /// Settlement-datum signals for the EXFER-QUOTE honor link
+    /// (`WAVE3_HONOR_DESIGN.md` §4.0). One entry per output carrying a
+    /// strict 16-byte quote_id (honorable) or a `datum_hash`-only
+    /// commitment (unhonorable, `[HOLE-M2]`).
+    pub output_datums: Vec<ExtractedOutputDatum>,
 }
 
 /// Detect a Left- or Right-arm spend from the witness bytes. The
@@ -433,5 +523,108 @@ mod tests {
     fn contract_hash_rejects_garbage() {
         assert!(contract_hash_of_script(&[]).is_none());
         assert!(contract_hash_of_script(&[0xAA, 0xBB]).is_none());
+    }
+
+    // ---- Strict settlement-datum decode (§4.0, `[HOLE-F1]`) ----
+
+    #[test]
+    fn strict_decode_accepts_exactly_16_bytes() {
+        let q: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        assert_eq!(strict_decode_quote_id(&q), Some(q));
+        // Full-equality semantics: the 16 bytes ARE the quote_id,
+        // returned verbatim.
+        assert_eq!(strict_decode_quote_id(&[0u8; 16]), Some([0u8; 16]));
+    }
+
+    #[test]
+    fn strict_decode_rejects_15_bytes() {
+        assert_eq!(strict_decode_quote_id(&[0xABu8; 15]), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_17_bytes() {
+        // 16-byte quote_id + 1 trailing byte must be rejected — no
+        // trailing bytes allowed.
+        assert_eq!(strict_decode_quote_id(&[0xABu8; 17]), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_32_bytes() {
+        // A 32-byte datum (e.g. two concatenated ids, the F1 attack)
+        // must NOT decode — never substring-match the first 16 bytes.
+        assert_eq!(strict_decode_quote_id(&[0xCDu8; 32]), None);
+    }
+
+    #[test]
+    fn strict_decode_rejects_empty_and_oversized() {
+        assert_eq!(strict_decode_quote_id(&[]), None);
+        assert_eq!(strict_decode_quote_id(&[0u8; 1]), None);
+        assert_eq!(strict_decode_quote_id(&[0u8; 4096]), None);
+    }
+
+    // ---- Output-loop datum extraction ----
+
+    fn output_with(
+        script_len: usize,
+        datum: Option<Vec<u8>>,
+        datum_hash: Option<Hash256>,
+    ) -> exfer::types::transaction::TxOutput {
+        exfer::types::transaction::TxOutput {
+            value: 1_000,
+            script: vec![0u8; script_len],
+            datum,
+            datum_hash,
+        }
+    }
+
+    fn tx_with_outputs(outputs: Vec<exfer::types::transaction::TxOutput>) -> Transaction {
+        Transaction {
+            inputs: Vec::new(),
+            outputs,
+            witnesses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extract_indexes_strict_16_byte_datum() {
+        let q = [0x7Au8; 16];
+        let tx = tx_with_outputs(vec![output_with(32, Some(q.to_vec()), None)]);
+        let ex = extract_from_tx(&tx, 10, 0);
+        assert_eq!(ex.output_datums.len(), 1);
+        let d = &ex.output_datums[0];
+        assert_eq!(d.output_index, 0);
+        assert_eq!(d.quote_id, Some(q));
+        assert!(!d.unhonorable);
+    }
+
+    #[test]
+    fn extract_does_not_index_oversized_datum() {
+        // 20-byte inline datum: neither a quote match nor unhonorable.
+        let tx = tx_with_outputs(vec![output_with(32, Some(vec![0xAB; 20]), None)]);
+        let ex = extract_from_tx(&tx, 10, 0);
+        assert!(
+            ex.output_datums.is_empty(),
+            "oversized inline datum must not be indexed"
+        );
+    }
+
+    #[test]
+    fn extract_flags_datum_hash_only_as_unhonorable() {
+        let tx = tx_with_outputs(vec![output_with(32, None, Some(Hash256([0x9; 32])))]);
+        let ex = extract_from_tx(&tx, 10, 0);
+        assert_eq!(ex.output_datums.len(), 1);
+        let d = &ex.output_datums[0];
+        assert_eq!(d.quote_id, None);
+        assert!(d.unhonorable, "datum_hash-only must be flagged unhonorable");
+    }
+
+    #[test]
+    fn extract_ignores_outputs_with_no_datum() {
+        let tx = tx_with_outputs(vec![output_with(32, None, None)]);
+        let ex = extract_from_tx(&tx, 10, 0);
+        assert!(ex.output_datums.is_empty());
     }
 }

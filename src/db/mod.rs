@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, HtlcSpendArm, SettlementRecord,
+    AddressActivity, ExtractedHtlcLock, ExtractedHtlcSpend, ExtractedOutputDatum, HtlcSpendArm,
+    SettlementRecord, QUOTE_ID_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,14 +221,62 @@ fn settlement_range_for(
 pub mod schema;
 
 use schema::{
-    BLOCK_META, CHAIN_TIP, CHAIN_TIP_KEY, HTLC_BY_HASHLOCK, HTLC_BY_RECEIVER, HTLC_BY_SENDER,
-    HTLC_BY_STATE, HTLC_FULL, SETTLEMENT_BY_ADDRESS, SETTLEMENT_BY_CONTRACT, SPENT_BY,
-    TX_BY_ADDRESS,
+    BLOCK_META, CHAIN_TIP, CHAIN_TIP_KEY, DATUM_BY_QUOTEID, HTLC_BY_HASHLOCK, HTLC_BY_RECEIVER,
+    HTLC_BY_SENDER, HTLC_BY_STATE, HTLC_FULL, OUTPUT_DATUM, SETTLEMENT_BY_ADDRESS,
+    SETTLEMENT_BY_CONTRACT, SPENT_BY, TX_BY_ADDRESS,
 };
+
+/// One row returned by [`Db::get_output_datum`] — the indexed
+/// settlement-datum signal for a single outpoint
+/// (`WAVE3_HONOR_DESIGN.md` §4.0 / §6). Stored as the value of the
+/// `OUTPUT_DATUM` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDatumRecord {
+    /// `Some(quote_id)` iff the output's inline datum strict-decoded to
+    /// exactly 16 bytes (`[HOLE-F1]`); `None` for `datum_hash`-only.
+    pub quote_id: Option<[u8; QUOTE_ID_BYTES]>,
+    /// `true` iff the output committed a datum by `datum_hash` with NO
+    /// inline datum (`[HOLE-M2]`) — the indexer cannot read it, so it
+    /// is unhonorable and must never become a quote match.
+    pub unhonorable: bool,
+    /// Block height the carrying output was first indexed at. Used by
+    /// reorg recovery (`wipe_above`) to drop datum rows above the
+    /// common ancestor; not part of the query surface.
+    #[serde(default)]
+    pub block_height: u64,
+}
+
+/// One outpoint returned by [`Db::find_settlements_by_quote_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatumOutpoint {
+    pub tx_id: [u8; 32],
+    pub output_index: u32,
+}
 
 // ---------------------------------------------------------------------------
 // Follower checkpoint
 // ---------------------------------------------------------------------------
+
+/// On-disk schema/feature version stamped into [`FollowerMeta`].
+///
+/// Bumped whenever a follower-side feature requires re-walking already
+/// scanned blocks to populate a newly added table. A DB whose persisted
+/// meta carries a `schema_version` strictly below this constant is forced
+/// to reindex from genesis on open (see [`Db::open`]) so the new tables
+/// backfill over `0..=last_indexed_height` — the only correctness-safe
+/// migration for a strict read-only indexer.
+///
+/// Version history:
+/// - `0` — pre-datum indexer (no `OUTPUT_DATUM` / `DATUM_BY_QUOTEID`).
+///   Any DB written before this field existed deserializes the missing
+///   field as `0` via `#[serde(default)]`, so it is correctly treated as
+///   "below current" and reindexed.
+/// - `1` — EXFER-QUOTE settlement-datum indexing (`WAVE3_HONOR_DESIGN.md`
+///   §4.0 / §6): adds the `OUTPUT_DATUM` + `DATUM_BY_QUOTEID` tables, which
+///   must be backfilled from genesis because EXFER-QUOTE is new and no
+///   historical settlement predates it (so a from-genesis re-walk indexes
+///   every on-chain settlement datum that exists).
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FollowerMeta {
@@ -237,6 +286,14 @@ pub struct FollowerMeta {
     /// Unix seconds when the follower first started. Stable across
     /// restarts; only the very first save writes it.
     pub started_at: u64,
+    /// On-disk schema/feature version. A DB synced before a follower
+    /// feature shipped carries a value below [`SCHEMA_VERSION`] (or, for
+    /// a DB predating this field, `0` via `#[serde(default)]`) and is
+    /// reindexed from genesis on [`Db::open`] so newly added tables
+    /// backfill over already-scanned blocks. `#[serde(default)]` keeps
+    /// old on-disk meta blobs decodable.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +333,84 @@ impl Db {
         }
         write.commit()?;
 
-        Ok(Self { db })
+        let this = Self { db };
+        this.migrate_schema()?;
+        Ok(this)
+    }
+
+    /// One-time, on-open schema migration. If the persisted follower
+    /// checkpoint carries a `schema_version` below [`SCHEMA_VERSION`], the
+    /// DB was synced before a follower feature that requires re-walking
+    /// already-scanned blocks (e.g. the EXFER-QUOTE settlement-datum tables
+    /// `OUTPUT_DATUM` / `DATUM_BY_QUOTEID`, added at version 1). The
+    /// just-created tables would otherwise stay permanently empty for every
+    /// pre-existing block, because the follower only ever indexes forward
+    /// from `last_indexed_height + 1` and reorg recovery is incidental, not
+    /// a migration.
+    ///
+    /// Fix: reset the checkpoint to genesis (height 0, zero block_id,
+    /// `full_scan_complete = false`) and stamp the current version, so the
+    /// next follower tick re-walks `0..=tip` and backfills the new tables
+    /// over all of history. `apply_block_events` is idempotent on replay,
+    /// so re-walking already-indexed blocks is safe. Stamping the version
+    /// in the SAME write transaction that resets the cursor guarantees the
+    /// reindex is triggered at most once: a crash before the reset commits
+    /// leaves the old (below-current) version on disk and the migration is
+    /// retried on the next open; a crash after commit sees the new version
+    /// and does not reindex again.
+    ///
+    /// A brand-new DB (no persisted meta) is stamped to the current version
+    /// directly — there is no history to re-walk, and the forward scan from
+    /// genesis already populates every table.
+    fn migrate_schema(&self) -> Result<()> {
+        let read = self.db.begin_read()?;
+        let persisted: Option<FollowerMeta> = {
+            let table = read.open_table(CHAIN_TIP)?;
+            match table.get(CHAIN_TIP_KEY)? {
+                Some(blob) => Some(
+                    bincode::deserialize(blob.value())
+                        .map_err(|e| Error::Storage(format!("decode meta: {e}")))?,
+                ),
+                None => None,
+            }
+        };
+        drop(read);
+
+        match persisted {
+            // No checkpoint yet — fresh DB. Stamp the current version so a
+            // forward scan from genesis (which already fills every table)
+            // is never mistaken for a stale DB needing a reindex.
+            None => {
+                let meta = FollowerMeta {
+                    schema_version: SCHEMA_VERSION,
+                    ..FollowerMeta::default()
+                };
+                self.save_meta(&meta)?;
+            }
+            // Up to date — nothing to do.
+            Some(meta) if meta.schema_version >= SCHEMA_VERSION => {}
+            // Below current — force a from-genesis reindex/backfill so the
+            // newly added tables are populated over already-scanned blocks.
+            Some(meta) => {
+                tracing::warn!(
+                    "indexer: schema_version {} < {}; resetting follower checkpoint to \
+                     genesis to backfill new tables (was synced to height {})",
+                    meta.schema_version,
+                    SCHEMA_VERSION,
+                    meta.last_indexed_height,
+                );
+                let reset = FollowerMeta {
+                    last_indexed_height: 0,
+                    last_indexed_block_id: [0u8; 32],
+                    full_scan_complete: false,
+                    // Preserve the original start time across the migration.
+                    started_at: meta.started_at,
+                    schema_version: SCHEMA_VERSION,
+                };
+                self.save_meta(&reset)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn raw(&self) -> &redb::Database {
@@ -858,6 +992,73 @@ impl Db {
         }
     }
 
+    // ---- EXFER-QUOTE settlement-datum reads ------------------------------
+
+    /// Forward outpoint → datum lookup (O(1)) for `get_output_datum`.
+    /// Returns the indexed settlement-datum signal for `(tx_id,
+    /// output_index)`: a strict 16-byte `quote_id` (honorable), an
+    /// unhonorable `datum_hash`-only marker, or `None` if the indexer
+    /// recorded no datum signal for that outpoint (no inline datum and
+    /// no datum_hash, or an oversized/malformed inline datum that was
+    /// dropped at index time per `[HOLE-F1]`).
+    pub fn get_output_datum(
+        &self,
+        tx_id: &[u8; 32],
+        output_index: u32,
+    ) -> Result<Option<OutputDatumRecord>> {
+        let read = self.db.begin_read()?;
+        let t = read.open_table(OUTPUT_DATUM)?;
+        let key = output_datum_key(tx_id, output_index);
+        let bytes_opt: Option<Vec<u8>> = {
+            let opt = t.get(key.as_slice())?;
+            opt.map(|g| g.value().to_vec())
+        };
+        match bytes_opt {
+            Some(b) => {
+                Ok(Some(bincode::deserialize(&b).map_err(|e| {
+                    Error::Storage(format!("decode output_datum: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Reverse index: every outpoint carrying this exact `quote_id`.
+    /// Indexes ONLY strict single 16-byte datums (`[HOLE-F1]`), so a
+    /// malformed/multi-id/`datum_hash`-only datum never appears here.
+    /// If a quote_id maps to multiple outpoints, ALL are returned — the
+    /// swap-side gate enforces 1:1; the indexer reports the facts.
+    /// Empty vec if none.
+    pub fn find_settlements_by_quote_id(
+        &self,
+        quote_id: &[u8; QUOTE_ID_BYTES],
+    ) -> Result<Vec<DatumOutpoint>> {
+        let read = self.db.begin_read()?;
+        let t = read.open_table(DATUM_BY_QUOTEID)?;
+        // Key layout: [quote_id(16); tx_id(32); output_index_be(4)] = 52 bytes.
+        let mut lo = [0u8; 52];
+        lo[..QUOTE_ID_BYTES].copy_from_slice(quote_id);
+        let mut hi = [0xFFu8; 52];
+        hi[..QUOTE_ID_BYTES].copy_from_slice(quote_id);
+
+        let mut out: Vec<DatumOutpoint> = Vec::new();
+        for entry in t.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+            let (k, _) = entry?;
+            let bytes = k.value();
+            if bytes.len() != 52 {
+                continue;
+            }
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&bytes[QUOTE_ID_BYTES..QUOTE_ID_BYTES + 32]);
+            let output_index = u32::from_be_bytes(bytes[QUOTE_ID_BYTES + 32..].try_into().unwrap());
+            out.push(DatumOutpoint {
+                tx_id,
+                output_index,
+            });
+        }
+        Ok(out)
+    }
+
     // ---- Follower checkpoint ---------------------------------------------
 
     pub fn load_meta(&self) -> Result<FollowerMeta> {
@@ -941,6 +1142,11 @@ impl Db {
                 write_spent_by_within_txn(&write, sb)?;
             }
 
+            // ---- 6b. EXFER-QUOTE settlement-datum index ----
+            for od in events.output_datums {
+                write_output_datum_within_txn(&write, od, events.height)?;
+            }
+
             // ---- 7. Advance chain-tip meta ----
             {
                 let mut t = write.open_table(CHAIN_TIP)?;
@@ -949,6 +1155,9 @@ impl Db {
                     last_indexed_block_id: events.block_id,
                     full_scan_complete: events.full_scan_complete,
                     started_at: events.started_at,
+                    // Stamp the current version on every checkpoint advance
+                    // so a migrated DB is not re-reindexed on the next open.
+                    schema_version: SCHEMA_VERSION,
                 };
                 let blob = bincode::serialize(&new_meta)
                     .map_err(|e| Error::Storage(format!("encode meta: {e}")))?;
@@ -1025,6 +1234,7 @@ impl Db {
             wipe_tx_by_address_above(&write, keep_below)?;
             wipe_settlements_above(&write, keep_below)?;
             wipe_spent_by_above(&write, keep_below)?;
+            wipe_output_datums_above(&write, keep_below)?;
         }
         write.commit()?;
         Ok(())
@@ -1047,6 +1257,10 @@ pub struct BlockApplyEvents<'a> {
     pub settlements: &'a [SettlementRecord],
     pub activity: &'a [AddressActivity],
     pub spent_by: &'a [SpentByCacheEntry],
+    /// EXFER-QUOTE settlement-datum signals (`WAVE3_HONOR_DESIGN.md`
+    /// §4.0 / §6). One per output carrying a strict 16-byte quote_id
+    /// (honorable) or a `datum_hash`-only commitment (unhonorable).
+    pub output_datums: &'a [ExtractedOutputDatum],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1301,6 +1515,80 @@ fn write_spent_by_within_txn(write: &redb::WriteTransaction, sb: &SpentByCacheEn
     Ok(())
 }
 
+/// Write one settlement-datum row into both the forward
+/// (`OUTPUT_DATUM`) and reverse (`DATUM_BY_QUOTEID`) indexes. The
+/// reverse index is populated ONLY for strict 16-byte quote_ids
+/// (`[HOLE-F1]`); `datum_hash`-only (unhonorable) rows live in the
+/// forward index alone so `get_output_datum` can flag them while
+/// `find_settlements_by_quote_id` never produces them as candidates.
+/// Idempotent on replay: re-inserting the same key is a no-op overwrite.
+fn write_output_datum_within_txn(
+    write: &redb::WriteTransaction,
+    od: &ExtractedOutputDatum,
+    height: u64,
+) -> Result<()> {
+    let rec = OutputDatumRecord {
+        quote_id: od.quote_id,
+        unhonorable: od.unhonorable,
+        block_height: height,
+    };
+    let blob = bincode::serialize(&rec)
+        .map_err(|e| Error::Storage(format!("encode output_datum: {e}")))?;
+    {
+        let mut t = write.open_table(OUTPUT_DATUM)?;
+        let key = output_datum_key(&od.tx_id, od.output_index);
+        t.insert(key.as_slice(), blob.as_slice())?;
+    }
+    if let Some(quote_id) = od.quote_id {
+        let mut t = write.open_table(DATUM_BY_QUOTEID)?;
+        let key = datum_by_quoteid_key(&quote_id, &od.tx_id, od.output_index);
+        t.insert(key.as_slice(), ())?;
+    }
+    Ok(())
+}
+
+fn wipe_output_datums_above(write: &redb::WriteTransaction, keep_below: u64) -> Result<()> {
+    // Forward table values carry block_height; collect victims, then
+    // drop the matching reverse-index rows (keyed by quote_id) too.
+    let victims: Vec<([u8; 36], OutputDatumRecord)> = {
+        let t = write.open_table(OUTPUT_DATUM)?;
+        let mut v = Vec::new();
+        for entry in t.iter()? {
+            let (k, val) = entry?;
+            if k.value().len() != 36 {
+                continue;
+            }
+            let rec: OutputDatumRecord = bincode::deserialize(val.value())
+                .map_err(|e| Error::Storage(format!("decode output_datum: {e}")))?;
+            if rec.block_height > keep_below {
+                let mut kk = [0u8; 36];
+                kk.copy_from_slice(k.value());
+                v.push((kk, rec));
+            }
+        }
+        v
+    };
+    {
+        let mut t = write.open_table(OUTPUT_DATUM)?;
+        for (k, _) in &victims {
+            t.remove(k.as_slice())?;
+        }
+    }
+    {
+        let mut t = write.open_table(DATUM_BY_QUOTEID)?;
+        for (k, rec) in &victims {
+            if let Some(quote_id) = rec.quote_id {
+                let mut tx_id = [0u8; 32];
+                tx_id.copy_from_slice(&k[..32]);
+                let output_index = u32::from_be_bytes(k[32..].try_into().unwrap());
+                let rkey = datum_by_quoteid_key(&quote_id, &tx_id, output_index);
+                let _ = t.remove(rkey.as_slice())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn wipe_tx_by_address_above(write: &redb::WriteTransaction, keep_below: u64) -> Result<()> {
     let victims = {
         let t = write.open_table(TX_BY_ADDRESS)?;
@@ -1501,4 +1789,25 @@ fn settlement_by_address_key(
 
 fn spent_by_key(prev_tx_id: &[u8; 32], output_index: u32) -> [u8; 36] {
     htlc_primary_key(prev_tx_id, output_index)
+}
+
+/// `OUTPUT_DATUM` key: `[tx_id(32); output_index_be(4)]` — same shape
+/// as the HTLC/spent-by outpoint key.
+fn output_datum_key(tx_id: &[u8; 32], output_index: u32) -> [u8; 36] {
+    htlc_primary_key(tx_id, output_index)
+}
+
+/// `DATUM_BY_QUOTEID` key: `[quote_id(16); tx_id(32); output_index_be(4)]`.
+/// A prefix range over the leading 16 bytes yields every outpoint for
+/// that quote_id.
+fn datum_by_quoteid_key(
+    quote_id: &[u8; QUOTE_ID_BYTES],
+    tx_id: &[u8; 32],
+    output_index: u32,
+) -> [u8; 52] {
+    let mut k = [0u8; 52];
+    k[..QUOTE_ID_BYTES].copy_from_slice(quote_id);
+    k[QUOTE_ID_BYTES..QUOTE_ID_BYTES + 32].copy_from_slice(tx_id);
+    k[QUOTE_ID_BYTES + 32..].copy_from_slice(&output_index.to_be_bytes());
+    k
 }
