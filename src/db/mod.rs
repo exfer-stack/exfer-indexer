@@ -287,11 +287,17 @@ pub struct FollowerMeta {
     /// restarts; only the very first save writes it.
     pub started_at: u64,
     /// On-disk schema/feature version. A DB synced before a follower
-    /// feature shipped carries a value below [`SCHEMA_VERSION`] (or, for
-    /// a DB predating this field, `0` via `#[serde(default)]`) and is
+    /// feature shipped carries a value below [`SCHEMA_VERSION`] and is
     /// reindexed from genesis on [`Db::open`] so newly added tables
-    /// backfill over already-scanned blocks. `#[serde(default)]` keeps
-    /// old on-disk meta blobs decodable.
+    /// backfill over already-scanned blocks.
+    ///
+    /// NOTE: this field was ADDED at v1, so a DB written before it existed
+    /// has no bytes for it. `#[serde(default)]` does NOT recover that — the
+    /// on-disk format is bincode, which is positional/non-self-describing, so
+    /// a missing trailing field is an EOF, not a defaulted value. Such legacy
+    /// blobs are instead caught at decode time in [`Db::migrate_schema`] and
+    /// treated as `schema_version 0` (the attribute is kept only so the field
+    /// would default cleanly under a self-describing format).
     #[serde(default)]
     pub schema_version: u32,
 }
@@ -367,10 +373,29 @@ impl Db {
         let persisted: Option<FollowerMeta> = {
             let table = read.open_table(CHAIN_TIP)?;
             match table.get(CHAIN_TIP_KEY)? {
-                Some(blob) => Some(
-                    bincode::deserialize(blob.value())
-                        .map_err(|e| Error::Storage(format!("decode meta: {e}")))?,
-                ),
+                Some(blob) => match bincode::deserialize::<FollowerMeta>(blob.value()) {
+                    Ok(meta) => Some(meta),
+                    // A checkpoint that EXISTS but no longer decodes into the
+                    // current FollowerMeta shape is a PRE-VERSIONING DB: it was
+                    // written before a field was added to FollowerMeta. The
+                    // `schema_version` field itself was introduced at v1, so a
+                    // v0 record is a strict byte-prefix of the current layout
+                    // and bincode hits "unexpected end of file" decoding it.
+                    //
+                    // Treat that as a legacy (schema_version 0) checkpoint that
+                    // needs the from-genesis backfill below — NOT a fatal error.
+                    // Returning the error here makes the binary CRASH-LOOP on
+                    // every upgrade that grows Meta (you can't read the version
+                    // to decide to migrate, because reading it is what fails),
+                    // and the migration that exists precisely for this case
+                    // never runs. The index is derived, rebuildable-from-chain
+                    // data, so reconstructing from genesis is always a safe
+                    // recovery for an unreadable cursor.
+                    Err(_) => Some(FollowerMeta {
+                        schema_version: 0,
+                        ..FollowerMeta::default()
+                    }),
+                },
                 None => None,
             }
         };
@@ -1810,4 +1835,66 @@ fn datum_by_quoteid_key(
     k[QUOTE_ID_BYTES..QUOTE_ID_BYTES + 32].copy_from_slice(tx_id);
     k[QUOTE_ID_BYTES + 32..].copy_from_slice(&output_index.to_be_bytes());
     k
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for the upgrade crash "decode meta: unexpected end of file".
+    // A DB written before the `schema_version` field existed stores a
+    // FollowerMeta blob that is a strict byte-PREFIX of the current layout, so
+    // bincode hits EOF decoding it into today's struct. open() must treat that
+    // undecodable-but-present checkpoint as a legacy (v0) DB and reindex from
+    // genesis — NOT propagate the decode error and crash-loop the binary.
+    #[test]
+    fn pre_versioning_meta_migrates_instead_of_crashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Create the DB + tables, then overwrite CHAIN_TIP with a v0-layout
+        // blob: every FollowerMeta field in order EXCEPT the trailing
+        // schema_version u32 that did not exist yet.
+        {
+            let db = Db::open(&path).unwrap();
+            let legacy = bincode::serialize(&(
+                7_777_u64,    // last_indexed_height
+                [0x11u8; 32], // last_indexed_block_id
+                true,         // full_scan_complete
+                1_700_000_000u64, // started_at
+                              // (no schema_version — pre-versioning layout)
+            ))
+            .unwrap();
+            // The blob really is undecodable as the current struct (the bug).
+            assert!(
+                bincode::deserialize::<FollowerMeta>(&legacy).is_err(),
+                "test premise: the v0 blob must fail to decode as current FollowerMeta"
+            );
+            let write = db.raw().begin_write().unwrap();
+            {
+                let mut t = write.open_table(CHAIN_TIP).unwrap();
+                t.insert(CHAIN_TIP_KEY, legacy.as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        // Reopen: must NOT error; must reset to genesis to backfill, and stamp
+        // the current version so it migrates at most once.
+        let db = Db::open(&path).unwrap();
+        let meta = db.load_meta().unwrap();
+        assert_eq!(
+            meta.last_indexed_height, 0,
+            "legacy DB must reset to genesis to backfill new tables"
+        );
+        assert!(!meta.full_scan_complete);
+        assert_eq!(
+            meta.schema_version, SCHEMA_VERSION,
+            "current version must be stamped after migration"
+        );
+
+        // And it stays migrated on a subsequent open (no repeat reindex).
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.load_meta().unwrap().schema_version, SCHEMA_VERSION);
+    }
 }
