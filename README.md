@@ -40,6 +40,9 @@ ops, MCP servers, and explorers.
 - `get_attestation_edges`, `detect_in_chain_swaps` — attestation graph
   + swap detection
 - `get_output_spent_by` — spent-by lookups
+- `get_output_datum`, `find_settlements_by_quote_id` — EXFER-QUOTE
+  settlement read surface (strict 16-byte `quote_id`-in-datum; the honor
+  layer's reverse lookup — see [Upgrades & reindex](#upgrades--reindex))
 - `ping` — liveness
 
 walletd transparently delegates non-owned queries here when started with
