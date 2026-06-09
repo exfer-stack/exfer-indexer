@@ -13,10 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Share wire types (HtlcRecord / HtlcState / try_parse_htlc /
-# structural_merkle_hash / …) with exfer-walletd via the upstream
-# crate. Pinned to a release tag at release time; the fork-branch pin
-# below is TEMPORARY until the structural-merkle-hash PR lands upstream
-# and a v1.12.x tag is cut.
+# structural_merkle_hash / …) with exfer-walletd via the upstream crate,
+# pinned to the branch that carries the observer-types + structural-merkle-hash
+# surface this service depends on.
 exfer = { git = "https://github.com/exfer-stack/exfer.git", branch = "downstream/observer-types-plus-structural" }
 
 # HTTP + JSON-RPC stack — same axum/tokio/tower set walletd uses so
