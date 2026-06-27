@@ -386,6 +386,10 @@ struct AddressHistoryParams {
     limit: Option<u32>,
     #[serde(default)]
     cursor: Option<String>,
+    /// Newest-first when true (default false = oldest-first, the historical
+    /// behaviour). Lets a paged client reach a busy address's latest rows.
+    #[serde(default)]
+    reverse: bool,
 }
 
 #[derive(Serialize)]
@@ -423,7 +427,7 @@ async fn get_address_history(state: &ApiState, params: Value) -> Result<Value> {
     };
     let db = state.db.clone();
     let (rows, next) = tokio::task::spawn_blocking(move || {
-        db.list_address_history(&address, p.since_height, limit, cursor)
+        db.list_address_history(&address, p.since_height, limit, cursor, p.reverse)
     })
     .await
     .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;

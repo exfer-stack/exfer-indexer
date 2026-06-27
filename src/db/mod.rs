@@ -929,13 +929,19 @@ impl Db {
 
     /// Walk every (address, height, tx_id, dir) row whose address
     /// prefix matches the requested address. Ordered by
-    /// `(height, tx_id)` ascending.
+    /// `(height, tx_id)` — ascending (oldest first) by default, or
+    /// descending (newest first) when `reverse` is set. `reverse` lets a
+    /// paged client fetch the most-recent rows first (and stop after N)
+    /// instead of being forced to page from the very oldest, which means a
+    /// heavily-used address's latest activity was unreachable behind a page
+    /// cap.
     pub fn list_address_history(
         &self,
         address: &[u8; 32],
         since_height: Option<u64>,
         limit: usize,
         cursor: Option<HistoryCursor>,
+        reverse: bool,
     ) -> Result<(Vec<AddressHistoryRow>, Option<HistoryCursor>)> {
         let read = self.db.begin_read()?;
         let t = read.open_table(TX_BY_ADDRESS)?;
@@ -971,12 +977,24 @@ impl Db {
             });
         }
         rows.sort_by(|a, b| {
-            a.block_height
+            let ord = a
+                .block_height
                 .cmp(&b.block_height)
-                .then_with(|| a.tx_id.cmp(&b.tx_id))
+                .then_with(|| a.tx_id.cmp(&b.tx_id));
+            if reverse {
+                ord.reverse()
+            } else {
+                ord
+            }
         });
         if let Some(c) = cursor {
-            rows.retain(|r| (r.block_height, &r.tx_id[..]) > (c.height, &c.tx_id[..]));
+            // Page forward through the chosen order: ascending keeps rows after
+            // the cursor, descending keeps rows before it.
+            if reverse {
+                rows.retain(|r| (r.block_height, &r.tx_id[..]) < (c.height, &c.tx_id[..]));
+            } else {
+                rows.retain(|r| (r.block_height, &r.tx_id[..]) > (c.height, &c.tx_id[..]));
+            }
         }
         let next = if rows.len() > limit {
             let last = &rows[limit - 1];
